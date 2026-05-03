@@ -527,6 +527,15 @@ function subdivisionControlRatio(territory, nationId) {
   return subdivisionControlCount(territory, nationId) / territory.subdivisions.length;
 }
 
+function totalSubdivisionControlCount(nationId) {
+  const nation = state.nations.get(nationId);
+  if (!nation) return 0;
+  return nation.territories.reduce((total, territoryId) => {
+    const territory = state.territories[territoryId];
+    return total + subdivisionControlCount(territory, nationId);
+  }, 0);
+}
+
 function transferSubdivisionControl(territory, toNationId, amount = 1, preferredIndexes = null, reason = "annexed") {
   if (!territory.subdivisions?.length) return 0;
   let moved = 0;
@@ -2597,7 +2606,8 @@ function maybeResolveWar(a, b, duration, monthScale = 1) {
     (occupiedShare > 0.5 ? 0.18 : 0);
 
   if (duration > 1.5 && seriousOccupation && rng() < scaledChance(collapseRisk, monthScale)) {
-    if (occupiedShare > 0.55 || (capitalLost && stronger.ideology.aggression > 0.72)) {
+    const annexationThreshold = 0.55 - stronger.ideology.aggression * 0.2; // Aggressive nations annex at lower occupation levels
+    if (occupiedShare > annexationThreshold || (capitalLost && stronger.ideology.aggression > 0.72)) {
       const territories = weaker.territories.slice();
       for (const territoryId of territories) {
         transferTerritory(territoryId, stronger.id, { quiet: true });
@@ -2824,8 +2834,20 @@ function tryPeacefulUnifications(monthScale = 1) {
       if (relation < 72) continue;
       const combinedAmbition = (a.ambition + b.ambition) / 2;
       const powerRatio = Math.max(a.power / Math.max(1, b.power), b.power / Math.max(1, a.power));
+      
+      // Cultural and ideological bonuses for unification
+      const sameReligion = a.religion === b.religion ? 0.015 : 0;
+      const ideologicalSimilarity = 1 - Math.abs(a.ideology.aggression - b.ideology.aggression);
+      const ideologyBonus = ideologicalSimilarity * 0.01;
+      
+      // Geographic proximity bonus (same continent)
+      const aContinents = new Set(a.territories.map(tid => state.territories[tid]?.continent));
+      const bContinents = new Set(b.territories.map(tid => state.territories[tid]?.continent));
+      const sharedContinents = [...aContinents].filter(c => bContinents.has(c)).length;
+      const continentBonus = sharedContinents > 0 ? 0.008 : 0;
+      
       const base = 0.006;
-      const chance = base + clamp((relation - 72) / 240, 0, 0.06) - combinedAmbition * 0.01 + (powerRatio > 2 ? 0.02 : 0);
+      const chance = base + clamp((relation - 72) / 240, 0, 0.06) - combinedAmbition * 0.01 + (powerRatio > 2 ? 0.02 : 0) + sameReligion + ideologyBonus + continentBonus;
       if (rng() < scaledChance(chance, monthScale)) {
         const absorber = a.power >= b.power ? a : b;
         const absorbed = absorber.id === a.id ? b : a;
@@ -2842,7 +2864,7 @@ function tryPeacefulUnifications(monthScale = 1) {
 
 function cleanupDefeatedNations() {
   for (const nation of state.nations.values()) {
-    if (nation.territories.length) continue;
+    if (totalSubdivisionControlCount(nation.id) > 0) continue;
     if (nation.alive) pushEvent("diplomacy", `${nation.name} leaves the world stage.`);
     nation.alive = false;
     for (const other of state.nations.values()) {
