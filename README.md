@@ -48,10 +48,14 @@ If the Windows `node` app alias is blocked, use any local static server from thi
 - Medieval Realms
 - Cold War Blocs
 - Napoleonic Europe
+
+## Notes
+
+- Caribbean and other island countries can now attack and be attacked via naval invasions, allowing for more dynamic global conflicts.
+- GDP falls during wars due to reduced trade access, increased instability, and war exhaustion penalties in the economy simulation.
 - WWII
 
 
 ## Notes
 
-- Caribbean countries cannot attack or be attacked due to lack of land borders (they are islands).
-- GDP falls during wars due to reduced trade access, increased instability, and war exhaustion penalties in the economy simulation.
+

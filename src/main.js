@@ -2015,6 +2015,11 @@ function warDesire(a, b, pair) {
   const aggression = (a.ideology.aggression + b.ideology.aggression + a.ambition + b.ambition) / 4;
   const geoEco = geoeconomicPressure(a, b, pair);
   const relationPenalty = Math.max(0, -relation - 62);
+  const isIslandWar = pair.fronts.length === 0 && (
+    a.territories.some(id => state.territories[id].subregion === "Caribbean") ||
+    b.territories.some(id => state.territories[id].subregion === "Caribbean")
+  );
+  const islandBonus = isIslandWar ? 0.005 : 0;
   return clamp(
     0.006 +
       aggression * 0.035 +
@@ -2022,7 +2027,8 @@ function warDesire(a, b, pair) {
       Math.min(pair.fronts.length, 6) * 0.0006 -
       allianceRisk * 0.9 +
       geoEco * 0.55 +
-      relationPenalty * 0.0005,
+      relationPenalty * 0.0005 +
+      islandBonus,
     0,
     0.12,
   );
@@ -2081,6 +2087,30 @@ function startWar(attackerId, defenderId, reason) {
   adjustRelation(attackerId, defenderId, -34);
   seedWarFronts(attacker, defender);
 
+  // For island wars, create a dummy border pair if none exists
+  if (!state.borderPairs.has(pairKey(attackerId, defenderId))) {
+    const dummyFronts = [];
+    // Create dummy fronts between capitals or random territories
+    const aTerr = state.territories[attacker.capitalId] || state.territories[attacker.territories[0]];
+    const bTerr = state.territories[defender.capitalId] || state.territories[defender.territories[0]];
+    if (aTerr && bTerr) {
+      dummyFronts.push([aTerr.id, bTerr.id]);
+    }
+    state.borderPairs.set(pairKey(attackerId, defenderId), { a: attackerId, b: defenderId, fronts: dummyFronts });
+  }
+
+  // For island wars, create a dummy border pair if none exists
+  if (!state.borderPairs.has(pairKey(attackerId, defenderId))) {
+    const dummyFronts = [];
+    // Create dummy fronts between capitals or random territories
+    const aTerr = state.territories[attacker.capitalId] || state.territories[attacker.territories[0]];
+    const bTerr = state.territories[defender.capitalId] || state.territories[defender.territories[0]];
+    if (aTerr && bTerr) {
+      dummyFronts.push([aTerr.id, bTerr.id]);
+    }
+    state.borderPairs.set(pairKey(attackerId, defenderId), { a: attackerId, b: defenderId, fronts: dummyFronts });
+  }
+
   for (const allyId of attacker.allies) {
     const ally = state.nations.get(allyId);
     if (ally?.alive && getRelation(ally.id, defenderId) < 36 && rng() < 0.22) {
@@ -2105,7 +2135,23 @@ function startWar(attackerId, defenderId, reason) {
 
 function seedWarFronts(attacker, defender) {
   const pair = state.borderPairs.get(pairKey(attacker.id, defender.id));
-  if (!pair?.fronts.length) return;
+  if (!pair?.fronts.length) {
+    // Handle island wars or distant wars: seed on capital or random territory
+    const targetTerritory = state.territories[defender.capitalId] || choice(defender.territories.map(id => state.territories[id]));
+    if (!targetTerritory || !targetTerritory.subdivisions?.length) return;
+    const fromTerritory = state.territories[attacker.capitalId] || choice(attacker.territories.map(id => state.territories[id]));
+    // Pick a random subdivision to attack
+    const bestIdx = Math.floor(rng() * targetTerritory.subdivisions.length);
+    const subdiv = targetTerritory.subdivisions[bestIdx];
+    if (subdiv.contestedById) return; // already contested
+    subdiv.contestedById = attacker.id;
+    subdiv.contestedFromTerritoryId = fromTerritory.id;
+    subdiv.contestedProgress = 0.03 + rng() * 0.03;
+    subdiv.contestedUpdatedAt = worldMonthIndex();
+    updateTerritoryContestStatus(targetTerritory);
+    if (rng() < 0.12) transferSubdivision(targetTerritory.id, bestIdx, attacker.id, { reason: "naval invasion", event: `${attacker.name} launches naval invasion on ${subdiv.name}.`, quiet: true });
+    return;
+  }
   for (const [leftId, rightId] of pair.fronts.slice(0, 8)) {
     const left = state.territories[leftId];
     const right = state.territories[rightId];
@@ -2213,9 +2259,33 @@ function processWars(monthScale = 1) {
 
     const pair = state.borderPairs.get(pairKey(aId, bId));
     const duration = worldMonthIndex() - (a.wars.get(bId)?.started ?? worldMonthIndex());
-    if (!pair || !pair.fronts.length) {
-      if (duration > 4 || rng() < scaledChance(0.2, monthScale)) {
-        endWar(aId, bId, `${a.name} and ${b.name} accept a ceasefire after the front disappears.`);
+    const isIslandWar = !pair || !pair.fronts.length;
+    if (isIslandWar) {
+      // For island wars, don't end quickly; instead, resolve naval battles
+      const tempo = Math.max(monthScale, 1 / 120);
+      if (monthScale >= 1 || rng() < scaledChance(0.5, tempo)) {
+        // Simulate naval battle: pick random territories
+        const aTerr = choice(a.territories.map(id => state.territories[id]));
+        const bTerr = choice(b.territories.map(id => state.territories[id]));
+        if (aTerr && bTerr) {
+          // Simple naval attack: damage economy or something
+          const damage = 0.01 * tempo;
+          b.treasury = Math.max(b.treasury - damage * b.gdp, b.treasury * 0.9);
+          a.warExhaustion = Math.min(a.warExhaustion + 0.02 * tempo, 1);
+          b.warExhaustion = Math.min(b.warExhaustion + 0.02 * tempo, 1);
+          if (rng() < 0.1 * tempo) {
+            // Occasional "victory": transfer a territory
+            const targetTerr = bTerr;
+            if (targetTerr.subdivisions?.length) {
+              const idx = Math.floor(rng() * targetTerr.subdivisions.length);
+              transferSubdivision(targetTerr.id, idx, a.id, { reason: "naval conquest", event: `${a.name} conquers ${targetTerr.subdivisions[idx].name} via naval invasion.` });
+            }
+          }
+        }
+      }
+      // End island war after longer time or by chance
+      if (duration > 12 || rng() < scaledChance(0.1, monthScale)) {
+        endWar(aId, bId, `${a.name} and ${b.name} end their naval war.`);
       }
       continue;
     }
@@ -4328,7 +4398,7 @@ function handleMapClick(event) {
     if (state.activeTool === "inspect") {
       state.selectedTerritoryId = null;
       state.selectedNationId = null;
-      updateUI();
+      renderAll();
       renderMap();
     }
     return;
@@ -4646,7 +4716,7 @@ function bindEvents() {
     if (!query) {
       state.selectedTerritoryId = null;
       state.selectedNationId = null;
-      updateUI();
+      renderAll();
       renderMap();
       return;
     }
