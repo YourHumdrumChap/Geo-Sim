@@ -59,3 +59,5 @@ If the Windows `node` app alias is blocked, use any local static server from thi
 - update everything in the README
 - add landmass graph
 - on app start, default to paused game
+- update world ledger graph
+- update some of the scenarios so that only the important parts of the map(for that specific scenario) is in play and cut off the rest of the map. For example, the medieval realms scenario should only have Europe as the map, not the whole globe.
