@@ -56,5 +56,5 @@ If the Windows `node` app alias is blocked, use any local static server from thi
 - two roman scenarios, one before the great schism during pax romana and one after
 - why can't countries in the carribean attack anyone or be attacked?
 - why does gdp fall during wars?
-- update ##systems in the README
+- update everything in the README
 - add landmass graph
