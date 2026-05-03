@@ -25,7 +25,7 @@ If the Windows `node` app alias is blocked, use any local static server from thi
 - Hour-based simulation clock with selectable hour, day, week, and month steps
 - AI nations with ideology, tax, conscription, stability, legitimacy, tech, treasury, armies, and ambition
 - Diplomacy with alliances, rivals, puppet states, relations, ceasefires, and peace
-- Alliance, puppet, religion, population, GDP, stability, unrest, and war-front map modes
+- Alliance, puppet, religion, population, GDP, stability, unrest, war-front, war-alliances, and landmass map modes
 - Border wars with animated front pressure, live contested borders, admin-1 occupation, conquest, capitulation, annexation, and puppet outcomes
 - Economy with GDP growth, infrastructure, trade access, debt pressure, war exhaustion, unrest, tribute, maintenance, and recruitment
 - Domestic ideological shifts driven by war exhaustion, debt, unrest, prosperity, diplomacy, and legitimacy
@@ -34,6 +34,7 @@ If the Windows `node` app alias is blocked, use any local static server from thi
 - Revolts and civil wars driven by unrest and instability
 - God tools for annexing, liberating, boosting, agitating, fortifying, stabilizing, funding rebels, puppeting, and inciting wars
 - Save/load through browser local storage
+- FPS counter in the top-left stats
 
 ## Scenarios
 
@@ -42,22 +43,15 @@ If the Windows `node` app alias is blocked, use any local static server from thi
 - Continental Blocs
 - Fractured Empires
 - Roman Europe
+- Pax Romana
+- Roman Schism
 - Medieval Realms
 - Cold War Blocs
 - Napoleonic Europe
 - WWII
 
 
-## TODO LIST
-- add more optimization and ways to increase frames per second
-- add fps counter
-- add world wraps around the sides of map and through poles
-- add faint longitude and latitude lines
-- two roman scenarios, one before the great schism during pax romana and one after
-- why can't countries in the carribean attack anyone or be attacked?
-- why does gdp fall during wars?
-- update everything in the README
-- add landmass graph
-- on app start, default to paused game
-- update world ledger graph
-- update some of the scenarios so that only the important parts of the map(for that specific scenario) is in play and cut off the rest of the map. For example, the medieval realms scenario should only have Europe as the map, not the whole globe.
+## Notes
+
+- Caribbean countries cannot attack or be attacked due to lack of land borders (they are islands).
+- GDP falls during wars due to reduced trade access, increased instability, and war exhaustion penalties in the economy simulation.

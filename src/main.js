@@ -150,6 +150,7 @@ const MAP_MODES = {
   population: "Population",
   wars: "War Fronts",
   warAlliances: "Wars & Alliances",
+  landmass: "Landmass",
 };
 
 const ADMIN1_SUMMARY = window.WORLD_ADMIN1_SUMMARY || { byIso: {}, byIso3: {}, byAdmin: {}, meta: null };
@@ -243,7 +244,7 @@ const state = {
   hour: 0,
   elapsedHours: 0,
   lastHistoryHours: null,
-  running: true,
+  running: false,
   speed: 4,
   timeStepHours: 1,
   scenario: "historic",
@@ -264,6 +265,9 @@ const state = {
   animationHandle: null,
   animationTime: 0,
   lastMapAnimation: 0,
+  fps: 0,
+  fpsCounter: 0,
+  lastFpsTime: 0,
   // unit system removed
   segmentMapCache: null,
   segmentMapDirty: false,
@@ -915,6 +919,8 @@ function initializeGame({ scenario = state.scenario, seed = Math.floor(Math.rand
   if (scenario === "continental") buildContinentalScenario();
   if (scenario === "fractured") buildSeededScenario(74, "fractured");
   if (scenario === "rome") buildRomeScenario();
+  if (scenario === "paxromana") buildPaxRomanaScenario();
+  if (scenario === "romanschism") buildRomanSchismScenario();
   if (scenario === "medieval") buildMedievalScenario();
   if (scenario === "crusades") buildCrusadesScenario();
   if (scenario === "ww2") buildWW2Scenario();
@@ -1084,6 +1090,46 @@ function buildRomeScenario() {
   );
   createScenarioNation("Parthian Shahdom", territoriesWhere((territory) => /Iran|Iraq|Afghanistan|Pakistan|Turkmenistan/.test(territory.originalName)), "Autocratic", { capitalName: "Iran", ambition: 0.7 });
   createScenarioNation("Germanic Confederation", territoriesWhere((territory) => /Germany|Poland|Czechia|Netherlands|Denmark|Sweden|Norway/.test(territory.originalName)), "Council", { capitalName: "Germany" });
+  createScenarioNation("Nile Kingdoms", territoriesWhere((territory) => /Sudan|Ethiopia|Eritrea|Somalia/.test(territory.originalName)), "Mercantile", { capitalName: "Ethiopia" });
+  fillRemainingWithRegionalStates("Tribal");
+}
+
+function buildPaxRomanaScenario() {
+  // Pax Romana: Unified Roman Empire at its height
+  createScenarioNation(
+    "Roman Empire",
+    territoriesWhere((territory) =>
+      territory.continent === "Europe" &&
+      /Italy|France|Spain|Portugal|Greece|Croatia|Slovenia|Bosnia|Serbia|Montenegro|Albania|Macedonia|Bulgaria|Romania|Turkey|Germany|Poland|Czechia|Netherlands|Denmark|Sweden|Norway|United Kingdom|Ireland/.test(territory.originalName),
+    ).concat(territoriesWhere((territory) => /Northern Africa|Western Asia/.test(territory.region) && /Egypt|Libya|Tunisia|Algeria|Morocco|Syria|Jordan|Israel|Lebanon|Iraq/.test(territory.originalName))),
+    "Autocratic",
+    { capitalName: "Italy", ambition: 0.9, stability: 0.8, treasury: 800 },
+  );
+  createScenarioNation("Parthian Shahdom", territoriesWhere((territory) => /Iran|Afghanistan|Pakistan|Turkmenistan/.test(territory.originalName)), "Autocratic", { capitalName: "Iran", ambition: 0.6 });
+  createScenarioNation("Nile Kingdoms", territoriesWhere((territory) => /Sudan|Ethiopia|Eritrea|Somalia/.test(territory.originalName)), "Mercantile", { capitalName: "Ethiopia" });
+  fillRemainingWithRegionalStates("Tribal");
+}
+
+function buildRomanSchismScenario() {
+  // After the Great Schism: Western and Eastern Roman Empires
+  createScenarioNation(
+    "Western Roman Empire",
+    territoriesWhere((territory) =>
+      /Italy|France|Spain|Portugal|Germany|Poland|Czechia|Netherlands|Denmark|Sweden|Norway|United Kingdom|Ireland/.test(territory.originalName),
+    ),
+    "Autocratic",
+    { capitalName: "Italy", ambition: 0.7, stability: 0.5, treasury: 300 },
+  );
+  createScenarioNation(
+    "Eastern Roman Empire",
+    territoriesWhere((territory) =>
+      /Greece|Croatia|Slovenia|Bosnia|Serbia|Montenegro|Albania|Macedonia|Bulgaria|Romania|Turkey/.test(territory.originalName),
+    ).concat(territoriesWhere((territory) => /Northern Africa|Western Asia/.test(territory.region) && /Egypt|Libya|Tunisia|Algeria|Morocco|Syria|Jordan|Israel|Lebanon|Iraq/.test(territory.originalName))),
+    "Autocratic",
+    { capitalName: "Greece", ambition: 0.75, stability: 0.55, treasury: 400 },
+  );
+  createScenarioNation("Parthian Shahdom", territoriesWhere((territory) => /Iran|Afghanistan|Pakistan|Turkmenistan/.test(territory.originalName)), "Autocratic", { capitalName: "Iran", ambition: 0.7 });
+  createScenarioNation("Germanic Confederation", territoriesWhere((territory) => /Austria|Switzerland|Belgium|Luxembourg/.test(territory.originalName)), "Council", { capitalName: "Austria" });
   createScenarioNation("Nile Kingdoms", territoriesWhere((territory) => /Sudan|Ethiopia|Eritrea|Somalia/.test(territory.originalName)), "Mercantile", { capitalName: "Ethiopia" });
   fillRemainingWithRegionalStates("Tribal");
 }
@@ -2801,6 +2847,13 @@ function startVisualLoop() {
   if (state.animationHandle) window.cancelAnimationFrame(state.animationHandle);
   const frame = (time) => {
     state.animationTime = time / 1000;
+    // Calculate FPS
+    state.fpsCounter++;
+    if (time - state.lastFpsTime >= 1000) {
+      state.fps = state.fpsCounter;
+      state.fpsCounter = 0;
+      state.lastFpsTime = time;
+    }
     if (time - state.lastMapAnimation > 120 && hasActiveFrontVisuals()) {
       state.lastMapAnimation = time;
       renderMap();
@@ -3071,8 +3124,8 @@ function drawOcean(toCtx = ctx, toCanvas = canvas) {
 
 function drawGraticule(toCtx = ctx, toCanvas = canvas) {
   toCtx.save();
-  toCtx.strokeStyle = "rgba(255,255,255,0.065)";
-  toCtx.lineWidth = 0.6;
+  toCtx.strokeStyle = "rgba(255,255,255,0.12)";
+  toCtx.lineWidth = 1.2;
   for (let lon = -180; lon <= 180; lon += 30) {
     const path = new Path2D();
     for (let lat = -80; lat <= 85; lat += 4) {
@@ -3234,6 +3287,9 @@ function fillForTerritory(territory, mode) {
     if (owner.allies.size) return "#4d7ec4";
     if (owner.puppets.size || owner.overlordId) return "#d8b84d";
     return owner.color;
+  }
+  if (mode === "landmass") {
+    return "#8B4513"; // Brown color for land
   }
   return owner.color;
 }
@@ -4050,6 +4106,7 @@ function renderStats() {
     statChip("Wars", wars.length),
     statChip("GDP", formatMoney(gdp)),
     statChip("People", formatPopulation(population)),
+    statChip("FPS", state.fps),
   ].join("");
   els.ledgerStats.innerHTML = detailRows([
     ["Scenario", scenarioName(state.scenario)],
@@ -4072,6 +4129,8 @@ function scenarioName(id) {
     fractured: "Fractured Empires",
     ww2: "World War II",
     rome: "Roman Europe",
+    paxromana: "Pax Romana",
+    romanschism: "Roman Schism",
     medieval: "Medieval Realms",
     coldwar: "Cold War Blocs",
     napoleonic: "Napoleonic Europe",

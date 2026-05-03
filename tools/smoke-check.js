@@ -230,7 +230,7 @@ async function main() {
     !initial.mapModes.includes("puppets") ||
     !initial.mapModes.includes("religions")
   ) process.exit(2);
-  if (!["rome", "medieval", "coldwar", "napoleonic"].every((scenario) => initial.scenarios.includes(scenario))) process.exit(11);
+  if (!["rome", "paxromana", "romanschism", "medieval", "coldwar", "napoleonic"].every((scenario) => initial.scenarios.includes(scenario))) process.exit(11);
   if (initial.universalNames < 100 || initial.territoriesWithFiveNames !== initial.territoryCount) process.exit(8);
   if (!forcedWar.started) process.exit(3);
   if (
