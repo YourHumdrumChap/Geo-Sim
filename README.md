@@ -58,3 +58,4 @@ If the Windows `node` app alias is blocked, use any local static server from thi
 - why does gdp fall during wars?
 - update everything in the README
 - add landmass graph
+- on app start, default to paused game
