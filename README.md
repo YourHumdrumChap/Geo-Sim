@@ -49,11 +49,12 @@ If the Windows `node` app alias is blocked, use any local static server from thi
 
 
 ## TODO LIST
-- more optimization and ways to increase frames per second
-- fps counter
-- world wraps around the sides of map and through poles
-- faint longitude and latitude lines
+- add more optimization and ways to increase frames per second
+- add fps counter
+- add world wraps around the sides of map and through poles
+- add faint longitude and latitude lines
 - two roman scenarios, one before the great schism during pax romana and one after
 - why can't countries in the carribean attack anyone or be attacked?
-- allow naval wars
 - why does gdp fall during wars?
+- update ##systems in the README
+- add landmass graph
