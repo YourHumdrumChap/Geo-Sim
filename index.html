@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Worldline Conflict Simulator</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="src/styles.css" />
+  </head>
+  <body>
+    <div id="app" class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <div>
+            <h1>Worldline Conflict Simulator</h1>
+            <p id="subtitle">AI nations, real borders, unstable history.</p>
+          </div>
+        </div>
+
+        <div class="topbar-controls" aria-label="Simulation controls">
+          <button id="playPauseBtn" class="icon-button primary" type="button" title="Play or pause">
+            <span id="playPauseIcon">▶</span>
+          </button>
+          <button id="stepBtn" class="icon-button" type="button" title="Advance one time step">↷</button>
+          <label class="control-field short">
+            <span>Speed</span>
+            <input id="speedRange" type="range" min="1" max="12" value="4" />
+          </label>
+          <label class="control-field compact">
+            <span>Step</span>
+            <select id="timeStepSelect">
+              <option value="1" selected>Hours</option>
+              <option value="24">Days</option>
+              <option value="168">Weeks</option>
+              <option value="720">Months</option>
+            </select>
+          </label>
+          <label class="control-field">
+            <span>Map</span>
+            <select id="mapModeSelect">
+              <option value="political">Political</option>
+              <option value="alliances">Alliances</option>
+              <option value="puppets">Puppets</option>
+              <option value="religions">Religions</option>
+              <option value="economy">GDP</option>
+              <option value="stability">Stability</option>
+              <option value="unrest">Unrest</option>
+              <option value="population">Population</option>
+              <option value="wars">War Fronts</option>
+              <option value="warAlliances">Wars & Alliances</option>
+            </select>
+          </label>
+          <label class="control-field compact">
+            <input id="countrySearch" type="text" placeholder="Search countries..." />
+          </label>
+            <span>Scenario</span>
+            <select id="scenarioSelect">
+              <option value="historic" selected>Modern States</option>
+              <option value="regional">Regional Powers</option>
+              <option value="continental">Continental Blocs</option>
+              <option value="fractured">Fractured Empires</option>
+              <option value="ww2">WWII</option>
+              <option value="rome">Roman Europe</option>
+              <option value="medieval">Medieval Realms</option>
+              <option value="crusades">Crusades</option>
+              <option value="coldwar">Cold War Blocs</option>
+              <option value="napoleonic">Napoleonic Europe</option>
+            </select>
+          </label>
+          <button id="newWorldBtn" type="button">New World</button>
+        </div>
+      </header>
+
+      <main class="game-layout">
+        <aside class="panel side-panel left-panel" aria-label="Selected territory and god tools">
+          <section class="panel-section">
+            <div class="section-heading">
+              <h2>Selection</h2>
+              <span id="selectedBadge" class="status-pill">None</span>
+            </div>
+            <div id="selectionDetails" class="details-grid"></div>
+          </section>
+
+          <section class="panel-section">
+            <div class="section-heading">
+              <h2>God Tools</h2>
+              <span id="toolHint" class="muted">Click map</span>
+            </div>
+            <div class="segmented" role="group" aria-label="Map tool">
+              <button class="tool-button active" type="button" data-tool="inspect" title="Inspect">⌖</button>
+              <button class="tool-button" type="button" data-tool="annex" title="Annex to selected nation">⇄</button>
+              <button class="tool-button" type="button" data-tool="liberate" title="Liberate territory">◇</button>
+              <button class="tool-button" type="button" data-tool="boost" title="Boost economy">＋</button>
+              <button class="tool-button" type="button" data-tool="agitate" title="Agitate unrest">!</button>
+              <button class="tool-button" type="button" data-tool="fortify" title="Fortify border">▣</button>
+            </div>
+            <div class="tool-actions">
+              <button id="stabilizeBtn" type="button">Stabilize</button>
+              <button id="fundRebelsBtn" type="button">Fund Rebels</button>
+              <button id="inciteWarBtn" type="button">Incite Border War</button>
+              <button id="puppetBtn" type="button">Make Puppet</button>
+            </div>
+          </section>
+
+          <section class="panel-section">
+            <div class="section-heading">
+              <h2>Nation AI</h2>
+              <span id="aiBadge" class="status-pill">Autonomous</span>
+            </div>
+            <div id="nationPolicy" class="policy-stack"></div>
+          </section>
+        </aside>
+
+        <section class="map-stage" aria-label="World map">
+          <canvas id="worldCanvas"></canvas>
+          <div class="map-overlay top-left">
+            <div id="dateLabel" class="date-chip">January 2026</div>
+            <div id="worldStats" class="world-stats"></div>
+          </div>
+          <div class="map-overlay bottom-left">
+            <button id="zoomInBtn" class="icon-button" type="button" title="Zoom in">＋</button>
+            <button id="zoomOutBtn" class="icon-button" type="button" title="Zoom out">−</button>
+            <button id="resetViewBtn" class="icon-button" type="button" title="Reset view">□</button>
+          </div>
+          <div id="mapTooltip" class="tooltip" hidden></div>
+        </section>
+
+        <aside class="panel side-panel right-panel" aria-label="World statistics and event log">
+          <section class="panel-section">
+            <div class="section-heading">
+              <h2>Great Powers</h2>
+              <span id="powerCount" class="muted"></span>
+            </div>
+            <ol id="leaderboard" class="leaderboard"></ol>
+          </section>
+
+          <section class="panel-section">
+            <div class="section-heading">
+              <h2>World Ledger</h2>
+              <button id="saveBtn" class="tiny-button" type="button">Save</button>
+              <button id="loadBtn" class="tiny-button" type="button">Load</button>
+            </div>
+            <canvas id="historyCanvas" class="history-canvas" width="320" height="94"></canvas>
+            <div id="ledgerStats" class="ledger-grid"></div>
+          </section>
+
+          <section class="panel-section">
+            <div class="section-heading">
+              <h2>Country Graphs</h2>
+              <span class="muted">Top powers</span>
+            </div>
+            <div id="countryGraphs" class="country-graphs"></div>
+          </section>
+
+          <section class="panel-section log-section">
+            <div class="section-heading">
+              <h2>Chronicle</h2>
+              <button id="clearLogBtn" class="tiny-button" type="button">Clear</button>
+            </div>
+            <div id="eventLog" class="event-log" aria-live="polite"></div>
+          </section>
+        </aside>
+      </main>
+    </div>
+
+    <script src="data/countries.js"></script>
+    <script src="data/admin1-summary.js"></script>
+    <script type="module">
+      (async function () {
+        try {
+          const resp = await fetch('data/admin1.geojson');
+          if (resp && resp.ok) {
+            window.WORLD_ADMIN1_GEO = await resp.json();
+          } else {
+            window.WORLD_ADMIN1_GEO = null;
+          }
+        } catch (e) {
+          window.WORLD_ADMIN1_GEO = null;
+        }
+        const s = document.createElement('script');
+        s.src = 'src/main.js';
+        document.head.appendChild(s);
+      })();
+    </script>
+  </body>
+</html>

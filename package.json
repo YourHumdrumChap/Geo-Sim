@@ -1,0 +1,12 @@
+{
+  "name": "worldline-conflict-simulator",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A browser-based world war, economy, and diplomacy sandbox using real country GeoJSON.",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "devDependencies": {
+    "playwright": "^1.59.1"
+  }
+}
