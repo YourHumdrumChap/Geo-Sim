@@ -157,6 +157,8 @@ const DATA_DRIVEN_MAP_MODES = new Set(["economy", "stability", "unrest", "popula
 const POLITICAL_SUBDIVISION_ZOOM = 2.45;
 const POPULATION_SUBDIVISION_ZOOM = 2.05;
 const SUBDIVISION_HIT_ZOOM = 2.45;
+const SUBDIVISION_MERGE_MIN_COUNT = 11;
+const SUBDIVISION_MERGE_MIN_KEEP = 8;
 const REVOLT_WINDOW_MONTHS = 12;
 const MAX_REVOLTS_PER_WINDOW = 5;
 const MAX_MAJOR_REVOLTS_PER_WINDOW = 2;
@@ -276,6 +278,8 @@ const state = {
   dragging: false,
   dragStart: null,
   lastPointer: null,
+  mapInteractionUntil: 0,
+  mapInteractionTimer: null,
   worldBounds: null,
   projection: null,
   animationHandle: null,
@@ -305,6 +309,7 @@ const state = {
   fillCacheDirty: true,
   bgCanvas: null,
   lastProjectionKey: null,
+  subdivisionPathDetailKey: null,
   eventLinkCache: null,
   nameIdeasDirty: true,
   // cached aggregates to avoid repeated array allocations
@@ -466,6 +471,115 @@ function normalizeAdminEntries(entries) {
   return unique.length ? unique.sort((a, b) => a.name.localeCompare(b.name)) : null;
 }
 
+function positiveSubdivisionWeight(value, fallback = 1) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+function subdivisionEntryPopulationWeight(entry) {
+  return positiveSubdivisionWeight(entry?.weight, 1);
+}
+
+function subdivisionEntryGdpWeight(entry) {
+  return positiveSubdivisionWeight(entry?.gdpWeight, subdivisionEntryPopulationWeight(entry));
+}
+
+function subdivisionEntryMergeScore(entry) {
+  return subdivisionEntryPopulationWeight(entry) + subdivisionEntryGdpWeight(entry) * 0.8;
+}
+
+function subdivisionEntryCentroid(entry, fallbackIndex = 0) {
+  if (entry?.rings?.length) {
+    try {
+      const point = representativePoint(entry.rings);
+      if (Number.isFinite(point?.[0]) && Number.isFinite(point?.[1])) return point;
+    } catch (e) {
+      /* use index fallback */
+    }
+  }
+  return [fallbackIndex, 0];
+}
+
+function subdivisionMergeRate(count) {
+  if (count >= 120) return 0.15;
+  if (count >= 60) return 0.12;
+  if (count >= 30) return 0.1;
+  return 0.05;
+}
+
+function nearestMergeTarget(source, targets) {
+  if (!targets.length) return null;
+  let best = targets[0];
+  let bestScore = Infinity;
+  const [sourceLon, sourceLat] = source._mergeCentroid || [source._mergeIndex, 0];
+  for (const target of targets) {
+    const [targetLon, targetLat] = target._mergeCentroid || [target._mergeIndex, 0];
+    const rawLonDelta = Math.abs(sourceLon - targetLon);
+    const lonDelta = Math.min(rawLonDelta, Math.abs(360 - rawLonDelta));
+    const latDelta = sourceLat - targetLat;
+    const indexDelta = Math.abs((source._mergeIndex ?? 0) - (target._mergeIndex ?? 0));
+    const score = lonDelta * lonDelta + latDelta * latDelta + indexDelta * 0.0001;
+    if (score < bestScore) {
+      best = target;
+      bestScore = score;
+    }
+  }
+  return best;
+}
+
+function mergeSubdivisionRings(targetRings, sourceRings) {
+  if (!sourceRings?.length) return targetRings || null;
+  if (!targetRings?.length) return sourceRings.slice();
+  return targetRings.concat(sourceRings);
+}
+
+function mergeSmallSubdivisionEntries(template) {
+  if (!template?.length || template.length < SUBDIVISION_MERGE_MIN_COUNT) {
+    return { entries: template || [], merged: 0 };
+  }
+
+  const maxMergeCount = template.length - SUBDIVISION_MERGE_MIN_KEEP;
+  const targetMergeCount = Math.max(1, Math.floor(template.length * subdivisionMergeRate(template.length)));
+  const mergeCount = Math.min(maxMergeCount, targetMergeCount);
+  if (mergeCount < 1) return { entries: template, merged: 0 };
+
+  const entries = template.map((entry, index) => ({
+    ...entry,
+    rings: Array.isArray(entry.rings) ? entry.rings.slice() : null,
+    weight: subdivisionEntryPopulationWeight(entry),
+    gdpWeight: subdivisionEntryGdpWeight(entry),
+    mergedCount: entry.mergedCount || 1,
+    _mergeIndex: index,
+    _mergeCentroid: subdivisionEntryCentroid(entry, index),
+  }));
+  const mergeCandidates = entries
+    .slice()
+    .sort(
+      (a, b) =>
+        subdivisionEntryMergeScore(a) - subdivisionEntryMergeScore(b) ||
+        safeName(a.name, "").localeCompare(safeName(b.name, "")),
+    )
+    .slice(0, mergeCount);
+  const mergeIndexes = new Set(mergeCandidates.map((entry) => entry._mergeIndex));
+  const kept = entries.filter((entry) => !mergeIndexes.has(entry._mergeIndex));
+
+  for (const source of mergeCandidates) {
+    const target = nearestMergeTarget(source, kept);
+    if (!target) continue;
+    target.weight = subdivisionEntryPopulationWeight(target) + subdivisionEntryPopulationWeight(source);
+    target.gdpWeight = subdivisionEntryGdpWeight(target) + subdivisionEntryGdpWeight(source);
+    target.rings = mergeSubdivisionRings(target.rings, source.rings);
+    target.mergedCount = (target.mergedCount || 1) + (source.mergedCount || 1);
+  }
+
+  return {
+    entries: kept
+      .sort((a, b) => a._mergeIndex - b._mergeIndex)
+      .map(({ _mergeIndex, _mergeCentroid, ...entry }) => entry),
+    merged: mergeCandidates.length,
+  };
+}
+
 function admin1GeometryEntries(territory) {
   const byIso = ADMIN1_GEOMETRY.byIso || {};
   const byIso3 = ADMIN1_GEOMETRY.byIso3 || {};
@@ -529,13 +643,19 @@ function ensureTerritorySubdivisions(territory, ownerId) {
         weight: e.weight ?? 1,
         gdpWeight: e.gdpWeight ?? e.weight ?? 1,
       }));
+      const merged = mergeSmallSubdivisionEntries(template);
+      template = merged.entries;
+      territory.mergedSubdivisionCount = merged.merged;
       territory.subdivisionSource = "admin1";
     } else {
       const n = Math.min(6, Math.max(1, Math.round(Math.log10(Math.max(100000, territory.population || 100000)) - 4 + 1)));
       template = new Array(n).fill(0).map((_, i) => ({ name: `${territory.originalName} ${i + 1}`, type: GENERIC_SUBDIVISION_TYPES[i % GENERIC_SUBDIVISION_TYPES.length] }));
       territory.subdivisionSource = "wedge";
+      territory.mergedSubdivisionCount = 0;
     }
     territory.subdivisionsTemplate = template;
+  } else {
+    territory.mergedSubdivisionCount ??= 0;
   }
 
   const weights = (territory.subdivisionsTemplate || []).map((entry) => entry.weight ?? 1);
@@ -837,6 +957,7 @@ function prepareTerritories(geojson) {
         subdivisionsTemplate: [],
         subdivisionsType: "Subdivision",
         subdivisionSource: "unknown",
+        mergedSubdivisionCount: 0,
         segments: buildTerritorySegments(lonLatRings, projectedRings),
         path: null,
       };
@@ -1084,6 +1205,7 @@ function initializeGame({ scenario = state.scenario, seed = Math.floor(Math.rand
     territory.subdivisions = [];
     territory.subdivisionsTemplate = [];
     territory.subdivisionSource = "unknown";
+    territory.mergedSubdivisionCount = 0;
     territory.maritimeNeighbors = territory.maritimeNeighbors || [];
     territory.capital = false;
   }
@@ -3543,6 +3665,20 @@ function renderAfterSimulationStep({ forceRender = false } = {}) {
   }
 }
 
+function isFastMapInteractionRender(time = performance.now()) {
+  return state.dragging || time < (state.mapInteractionUntil || 0);
+}
+
+function requestDetailedMapRenderAfterInteraction(delay = 140) {
+  state.mapInteractionUntil = performance.now() + delay;
+  if (state.mapInteractionTimer) window.clearTimeout(state.mapInteractionTimer);
+  state.mapInteractionTimer = window.setTimeout(() => {
+    state.mapInteractionTimer = null;
+    state.mapInteractionUntil = 0;
+    renderMap();
+  }, delay + 20);
+}
+
 function startVisualLoop() {
   if (state.animationHandle) window.cancelAnimationFrame(state.animationHandle);
   const frame = (time) => {
@@ -3605,6 +3741,7 @@ function clearScreenPathCaches() {
   }
   state.borderPathCache = null;
   state.ownerBoundaryCache.clear();
+  state.subdivisionPathDetailKey = null;
 }
 
 function shouldPrepareSubdivisionPaths(mode = state.mapMode) {
@@ -3644,6 +3781,8 @@ function renderMap() {
 
   const mode = state.mapMode;
   const territories = state.territories;
+  const renderSubdivisionDetail = shouldPrepareSubdivisionPaths(mode) && !isFastMapInteractionRender();
+  const rebuildSubdivisionPaths = renderSubdivisionDetail && state.subdivisionPathDetailKey !== projectionKey;
   // Cache global aggregates once per render to avoid repeated allocations
   if (mode === "population" || mode === "economy") {
     let maxPop = 1;
@@ -3683,7 +3822,7 @@ function renderMap() {
   }
 
   // Cache expensive subdivision Path2D objects only when the current zoom/mode can show them.
-  if (rebuildPaths && shouldPrepareSubdivisionPaths(mode)) {
+  if (rebuildSubdivisionPaths) {
     for (const territory of territories) {
       const bounds = territory.screenBounds || screenBoundsForTerritory(territory, true);
       // cache screen bounds for reuse
@@ -3733,16 +3872,18 @@ function renderMap() {
         }
       }
     }
+    state.subdivisionPathDetailKey = projectionKey;
+  }
 
-    // Update segment ownership map and cache segment screen positions when projection changes
+  // Borders must update on every zoom/pan projection change, even when subdivision
+  // detail is hidden by LOD.
+  if (rebuildPaths) {
     const segmentMap = currentSegmentOwnerMap();
-    if (rebuildPaths && segmentMap) {
-      for (const entry of segmentMap.values()) {
-        const seg = entry.segment;
-        if (seg && seg.a && seg.b) {
-          seg.screenA = projectToScreen(seg.a);
-          seg.screenB = projectToScreen(seg.b);
-        }
+    for (const entry of segmentMap.values()) {
+      const seg = entry.segment;
+      if (seg && seg.a && seg.b) {
+        seg.screenA = projectToScreen(seg.a);
+        seg.screenB = projectToScreen(seg.b);
       }
     }
   }
@@ -3800,7 +3941,7 @@ function renderMap() {
         fctx.fillStyle = fillForTerritory(territory, mode);
         fctx.fill(path, "evenodd");
         // render subdivisions into the fill cache for population/political modes
-        if (mode === "population" && shouldPrepareSubdivisionPaths(mode) && territory.subdivisions?.length) {
+        if (mode === "population" && renderSubdivisionDetail && territory.subdivisions?.length) {
           renderTerritorySubdivisionsToCtx(territory, fctx, maxSubdivisionPopulation);
         }
       }
@@ -3825,8 +3966,8 @@ function renderMap() {
       }
     }
   }
-  if (mode === "population" && !didUseFillCache && shouldPrepareSubdivisionPaths(mode)) drawPopulationSubdivisions();
-  if (mode === "political") drawSubdivisionsOverlay();
+  if (mode === "population" && !didUseFillCache && renderSubdivisionDetail) drawPopulationSubdivisions();
+  if (mode === "political" && renderSubdivisionDetail) drawSubdivisionsOverlay();
   drawContestedTerritories();
   drawMapBorders(mode);
 
@@ -4353,8 +4494,19 @@ function drawSubdivisionControlCells(territory, controllerId, color) {
 }
 
 function drawContestedTerritories() {
+  const fastInteractionRender = isFastMapInteractionRender();
   for (const territory of state.territories) {
     if (!territory.path || !territory.subdivisions?.length) continue;
+    if (fastInteractionRender) {
+      if (territory.captureFlash > 0.01) {
+        ctx.save();
+        ctx.globalAlpha = territory.captureFlash * 0.26;
+        ctx.fillStyle = "#f4efe2";
+        ctx.fill(territory.path, "evenodd");
+        ctx.restore();
+      }
+      continue;
+    }
     const hasSubdivisionVisual =
       territory.captureFlash > 0.01 ||
       territory.subdivisions.some((s) => (s.contestedById && s.contestedProgress > 0.01) || s.ownerId !== territory.ownerId);
@@ -4488,6 +4640,7 @@ function drawWarFronts() {
 
 function drawSubdivisionFronts() {
   if (state.view.zoom < 0.9) return;
+  if (isFastMapInteractionRender()) return;
   ctx.save();
   for (const territory of state.territories) {
     if (!territory.subdivisions?.length) continue;
@@ -5314,9 +5467,20 @@ function updateTooltip(event) {
   if (hoverChanged) renderMap();
 }
 
-function zoomBy(multiplier) {
-  state.view.zoom = clamp(state.view.zoom * multiplier, 0.72, 7);
+function zoomAt(multiplier, anchor = { x: canvas.width / 2, y: canvas.height / 2 }, { deferDetail = false } = {}) {
+  const previousZoom = state.view.zoom;
+  const nextZoom = clamp(previousZoom * multiplier, 0.72, 7);
+  if (nextZoom === previousZoom) return;
+  if (deferDetail) requestDetailedMapRenderAfterInteraction();
+  const ratio = nextZoom / previousZoom;
+  state.view.zoom = nextZoom;
+  state.view.panX = anchor.x - (anchor.x - state.view.panX - canvas.width / 2) * ratio - canvas.width / 2;
+  state.view.panY = anchor.y - (anchor.y - state.view.panY - canvas.height / 2) * ratio - canvas.height / 2;
   renderMap();
+}
+
+function zoomBy(multiplier) {
+  zoomAt(multiplier);
 }
 
 function saveGame() {
@@ -5361,6 +5525,7 @@ function saveGame() {
       captureFlash: territory.captureFlash,
       subdivisionsType: territory.subdivisionsType || "Subdivision",
       subdivisionSource: territory.subdivisionSource || "unknown",
+      mergedSubdivisionCount: territory.mergedSubdivisionCount || 0,
       subdivisionsTemplate: territory.subdivisionsTemplate || [],
       subdivisions: (territory.subdivisions || []).map((subdivision) => {
         const { path, ...rest } = subdivision;
@@ -5436,6 +5601,7 @@ function loadGame() {
     territory.iso2 = data.iso2 ?? territory.iso2 ?? "";
     territory.subdivisionsType = data.subdivisionsType ?? territory.subdivisionsType ?? "Subdivision";
     territory.subdivisionSource = data.subdivisionSource ?? territory.subdivisionSource ?? "unknown";
+    territory.mergedSubdivisionCount = data.mergedSubdivisionCount ?? territory.mergedSubdivisionCount ?? 0;
     territory.subdivisionsTemplate = data.subdivisionsTemplate ?? territory.subdivisionsTemplate ?? [];
     territory.subdivisions = data.subdivisions ?? territory.subdivisions ?? [];
     for (const subdivision of territory.subdivisions || []) {
@@ -5614,19 +5780,14 @@ function bindEvents() {
     state.dragging = false;
     canvas.releasePointerCapture(event.pointerId);
     canvas.classList.remove("dragging");
+    renderMap();
   });
   canvas.addEventListener(
     "wheel",
     (event) => {
       event.preventDefault();
-      const before = canvasPoint(event);
-      const previousZoom = state.view.zoom;
       const multiplier = event.deltaY < 0 ? 1.12 : 0.9;
-      state.view.zoom = clamp(state.view.zoom * multiplier, 0.72, 7);
-      const ratio = state.view.zoom / previousZoom;
-      state.view.panX = before.x - (before.x - state.view.panX - canvas.width / 2) * ratio - canvas.width / 2;
-      state.view.panY = before.y - (before.y - state.view.panY - canvas.height / 2) * ratio - canvas.height / 2;
-      renderMap();
+      zoomAt(multiplier, canvasPoint(event), { deferDetail: true });
     },
     { passive: false },
   );
