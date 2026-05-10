@@ -101,7 +101,7 @@
             <div class="tool-actions">
               <button id="stabilizeBtn" type="button">Stabilize</button>
               <button id="fundRebelsBtn" type="button">Fund Rebels</button>
-              <button id="inciteWarBtn" type="button">Incite Border War</button>
+              <button id="inciteWarBtn" type="button">Start War</button>
               <button id="puppetBtn" type="button">Make Puppet</button>
             </div>
           </section>
@@ -169,22 +169,8 @@
 
     <script src="data/countries.js"></script>
     <script src="data/admin1-summary.js"></script>
-    <script type="module">
-      (async function () {
-        try {
-          const resp = await fetch('data/admin1.geojson');
-          if (resp && resp.ok) {
-            window.WORLD_ADMIN1_GEO = await resp.json();
-          } else {
-            window.WORLD_ADMIN1_GEO = null;
-          }
-        } catch (e) {
-          window.WORLD_ADMIN1_GEO = null;
-        }
-        const s = document.createElement('script');
-        s.src = 'src/main.js';
-        document.head.appendChild(s);
-      })();
-    </script>
+    <script src="data/admin1-geometry.js"></script>
+    <script src="src/main.js"></script>
   </body>
 </html>
+

@@ -154,6 +154,7 @@ const MAP_MODES = {
 };
 
 const ADMIN1_SUMMARY = window.WORLD_ADMIN1_SUMMARY || { byIso: {}, byIso3: {}, byAdmin: {}, meta: null };
+const ADMIN1_GEOMETRY = window.WORLD_ADMIN1_GEOMETRY || { byIso: {}, byIso3: {}, byAdmin: {}, meta: null };
 const GENERIC_SUBDIVISION_TYPES = ["Province", "Region", "Territory", "District"];
 
 const PALETTE = [
@@ -252,7 +253,9 @@ const state = {
   activeTool: "inspect",
   selectedTerritoryId: null,
   selectedNationId: null,
+  selectedSubdivisionId: null,
   hoveredTerritoryId: null,
+  hoveredSubdivisionId: null,
   nextNationId: 1,
   seed: Math.floor(Math.random() * 1_000_000),
   tickHandle: null,
@@ -403,7 +406,46 @@ function territorySubdivisionEntries(territory) {
   return null;
 }
 
+function normalizeAdminEntries(entries) {
+  if (!entries?.length) return null;
+  const seen = new Set();
+  const unique = [];
+  for (const entry of entries) {
+    const name = safeName(entry.name, "");
+    if (!name) continue;
+    const type = safeName(entry.type, "Subdivision");
+    const key = `${normalizeKey(name)}|${normalizeKey(type)}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push({
+      name,
+      type,
+      rings: entry.rings || null,
+      weight: entry.weight ?? 1,
+      gdpWeight: entry.gdpWeight ?? entry.weight ?? 1,
+    });
+  }
+  return unique.length ? unique.sort((a, b) => a.name.localeCompare(b.name)) : null;
+}
+
+function admin1GeometryEntries(territory) {
+  const byIso = ADMIN1_GEOMETRY.byIso || {};
+  const byIso3 = ADMIN1_GEOMETRY.byIso3 || {};
+  const byAdmin = ADMIN1_GEOMETRY.byAdmin || {};
+  const entries = [];
+  const iso2 = safeName(territory.iso2, "").toUpperCase();
+  const iso3 = safeName(territory.iso, "").toUpperCase();
+  const adminKey = normalizeKey(territory.originalName || territory.name || territory.longName || "");
+  if (iso2 && byIso[iso2]?.length) entries.push(...byIso[iso2]);
+  if (iso3 && byIso3[iso3]?.length) entries.push(...byIso3[iso3]);
+  if (adminKey && byAdmin[adminKey]?.length) entries.push(...byAdmin[adminKey]);
+  return normalizeAdminEntries(entries);
+}
+
 function admin1SubdivisionEntries(territory) {
+  const compiled = admin1GeometryEntries(territory);
+  if (compiled?.length) return compiled;
+
   const src = window.WORLD_ADMIN1_GEO;
   if (!src?.features?.length) return null;
   const entries = [];
@@ -430,16 +472,7 @@ function admin1SubdivisionEntries(territory) {
       entries.push({ name, type, rings: geometryToRings(feature.geometry) });
     }
   }
-  if (!entries.length) return null;
-  const seen = new Set();
-  const unique = [];
-  for (const e of entries) {
-    if (!seen.has(e.name)) {
-      seen.add(e.name);
-      unique.push(e);
-    }
-  }
-  return unique.sort((a, b) => a.name.localeCompare(b.name));
+  return normalizeAdminEntries(entries);
 }
 
 function ensureTerritorySubdivisions(territory, ownerId) {
@@ -451,7 +484,13 @@ function ensureTerritorySubdivisions(territory, ownerId) {
   if (!template) {
     const adminEntries = admin1SubdivisionEntries(territory) || territorySubdivisionEntries(territory) || null;
     if (adminEntries && adminEntries.length) {
-      template = adminEntries.map((e) => ({ name: e.name, type: e.type, rings: e.rings || null }));
+      template = adminEntries.map((e) => ({
+        name: e.name,
+        type: e.type,
+        rings: e.rings || null,
+        weight: e.weight ?? 1,
+        gdpWeight: e.gdpWeight ?? e.weight ?? 1,
+      }));
       territory.subdivisionSource = "admin1";
     } else {
       const n = Math.min(6, Math.max(1, Math.round(Math.log10(Math.max(100000, territory.population || 100000)) - 4 + 1)));
@@ -528,12 +567,9 @@ function subdivisionControlRatio(territory, nationId) {
 }
 
 function totalSubdivisionControlCount(nationId) {
-  const nation = state.nations.get(nationId);
-  if (!nation) return 0;
-  return nation.territories.reduce((total, territoryId) => {
-    const territory = state.territories[territoryId];
-    return total + subdivisionControlCount(territory, nationId);
-  }, 0);
+  let total = 0;
+  for (const territory of state.territories) total += subdivisionControlCount(territory, nationId);
+  return total;
 }
 
 function transferSubdivisionControl(territory, toNationId, amount = 1, preferredIndexes = null, reason = "annexed") {
@@ -804,7 +840,71 @@ function incomeScore(group) {
   return 2.5;
 }
 
+function addNeighborLink(territories, aId, bId, maritime = false) {
+  const a = territories[aId];
+  const b = territories[bId];
+  if (!a || !b || a.id === b.id) return;
+  if (!a.neighbors.includes(b.id)) a.neighbors.push(b.id);
+  if (!b.neighbors.includes(a.id)) b.neighbors.push(a.id);
+  if (maritime) {
+    a.maritimeNeighbors = a.maritimeNeighbors || [];
+    b.maritimeNeighbors = b.maritimeNeighbors || [];
+    if (!a.maritimeNeighbors.includes(b.id)) a.maritimeNeighbors.push(b.id);
+    if (!b.maritimeNeighbors.includes(a.id)) b.maritimeNeighbors.push(a.id);
+  }
+}
+
+function territoryDescriptor(territory) {
+  return `${territory.originalName || territory.name || ""} ${territory.region || ""} ${territory.subregion || ""} ${territory.continent || ""}`.toLowerCase();
+}
+
+function isIslandLikeTerritory(territory) {
+  const text = territoryDescriptor(territory);
+  return (
+    territory.neighbors.length < 2 ||
+    /caribbean|oceania|island|bahamas|barbados|dominica|grenada|jamaica|trinidad|tobago|cuba|haiti|dominican|saint|st\.? kitts|st\.? lucia|st\.? vincent|antigua|mauritius|seychelles|comoros|maldives|fiji|samoa|tonga|vanuatu|solomon|kiribati|micronesia|marshall|palau|tuvalu|nauru|cape verde|sao tome|timor|cyprus|iceland|greenland/.test(text)
+  );
+}
+
+function maritimeNeighborLimit(territory) {
+  const text = territoryDescriptor(territory);
+  if (/caribbean|bahamas|barbados|dominica|grenada|jamaica|trinidad|tobago|cuba|haiti|dominican|saint|st\.? kitts|st\.? lucia|st\.? vincent|antigua/.test(text)) return 6;
+  if (/oceania|pacific|island|maldives|fiji|samoa|tonga|vanuatu|solomon|kiribati|micronesia|marshall|palau|tuvalu|nauru/.test(text)) return 5;
+  if (territory.neighbors.length < 1) return 4;
+  if (territory.neighbors.length < 2) return 3;
+  return 0;
+}
+
+function buildMaritimeAdjacency(territories) {
+  for (const territory of territories) territory.maritimeNeighbors = [];
+  for (const territory of territories) {
+    const limit = maritimeNeighborLimit(territory);
+    if (!limit) continue;
+    const islandLike = isIslandLikeTerritory(territory);
+    const maxDistance = territory.neighbors.length < 1 ? 3400 : islandLike ? 2400 : 1250;
+    const candidates = territories
+      .filter((other) => other.id !== territory.id)
+      .map((other) => {
+        const distance = haversine(territory.geoCentroid, other.geoCentroid);
+        const sameRegion = territory.region && territory.region === other.region;
+        const sameContinent = territory.continent && territory.continent === other.continent;
+        const sameSubregion = territory.subregion && territory.subregion === other.subregion;
+        const score = distance * (sameSubregion ? 0.54 : sameRegion ? 0.68 : sameContinent ? 0.84 : 1.15);
+        return { id: other.id, distance, score };
+      })
+      .filter((candidate) => candidate.distance <= maxDistance || territory.neighbors.length < 1)
+      .sort((a, b) => a.score - b.score)
+      .slice(0, limit);
+    for (const candidate of candidates) addNeighborLink(territories, territory.id, candidate.id, true);
+  }
+}
+
 function buildAdjacency(territories) {
+  for (const territory of territories) {
+    territory.neighbors = [];
+    territory.maritimeNeighbors = [];
+  }
+
   const vertexOwners = new Map();
   for (const territory of territories) {
     for (const ring of territory.lonLatRings) {
@@ -835,8 +935,7 @@ function buildAdjacency(territories) {
   for (const [key, count] of shared) {
     if (count < 2) continue;
     const [a, b] = key.split("|").map(Number);
-    territories[a].neighbors.push(b);
-    territories[b].neighbors.push(a);
+    addNeighborLink(territories, a, b, false);
   }
 
   for (const territory of territories) {
@@ -853,15 +952,16 @@ function buildAdjacency(territories) {
       .sort((a, b) => a.score - b.score)
       .slice(0, territory.neighbors.length ? 1 : 2);
 
-    for (const candidate of candidates) {
-      if (!territory.neighbors.includes(candidate.id)) territory.neighbors.push(candidate.id);
-      const other = territories[candidate.id];
-      if (!other.neighbors.includes(territory.id)) other.neighbors.push(territory.id);
-    }
+    for (const candidate of candidates) addNeighborLink(territories, territory.id, candidate.id, true);
   }
+
+  buildMaritimeAdjacency(territories);
 
   for (const territory of territories) {
     territory.neighbors = [...new Set(territory.neighbors)].sort((a, b) => a - b);
+    territory.maritimeNeighbors = [...new Set(territory.maritimeNeighbors || [])]
+      .filter((id) => id !== territory.id)
+      .sort((a, b) => a - b);
   }
 }
 
@@ -895,7 +995,9 @@ function initializeGame({ scenario = state.scenario, seed = Math.floor(Math.rand
   state.nextNationId = 1;
   state.selectedTerritoryId = null;
   state.selectedNationId = null;
+  state.selectedSubdivisionId = null;
   state.hoveredTerritoryId = null;
+  state.hoveredSubdivisionId = null;
   state.view = { zoom: 1, panX: 0, panY: 0 };
   syncCalendarFromHours();
 
@@ -919,7 +1021,9 @@ function initializeGame({ scenario = state.scenario, seed = Math.floor(Math.rand
     territory.ownerHistory = [];
     territory.originalOwnerId = null;
     territory.subdivisions = [];
+    territory.subdivisionsTemplate = [];
     territory.subdivisionSource = "unknown";
+    territory.maritimeNeighbors = territory.maritimeNeighbors || [];
     territory.capital = false;
   }
 
@@ -1561,7 +1665,8 @@ function gradeForRating(rating) {
 }
 
 function nationNameIdeas(nation) {
-  const territories = nation.territories.map((id) => state.territories[id]).filter(Boolean);
+  const territoryIds = nation.territories?.length ? nation.territories : nation.controlledTerritories || [];
+  const territories = territoryIds.map((id) => state.territories[id]).filter(Boolean);
   const dominant = territories.slice().sort((a, b) => b.gdp + b.population / 1_000_000 - (a.gdp + a.population / 1_000_000))[0];
   const baseIdeas = dominant?.alternateNames?.length ? dominant.alternateNames : countryNameBank(dominant?.originalName || nation.name);
   const behaviorIdeas = territories
@@ -1573,45 +1678,86 @@ function nationNameIdeas(nation) {
 function recalculateNationStats() {
   for (const nation of state.nations.values()) {
     nation.territories = [];
+    nation.controlledTerritories = [];
+    nation.controlledSubdivisions = 0;
     nation.population = 0;
     nation.gdp = 0;
     nation.power = 0;
     nation.alive = false;
   }
 
-  for (const territory of state.territories) {
-    const nation = state.nations.get(territory.ownerId);
-    if (!nation) continue;
+  const addShare = (nationId, territory, populationShare, gdpShare, officialOwner = false) => {
+    const nation = state.nations.get(nationId);
+    if (!nation) return;
     nation.alive = true;
-    nation.territories.push(territory.id);
-    nation.population += territory.population;
-    nation.gdp += territory.gdp * territory.infrastructure * (1 - territory.unrest * 0.28);
+    if (officialOwner && !nation.territories.includes(territory.id)) nation.territories.push(territory.id);
+    if (!nation.controlledTerritories.includes(territory.id)) nation.controlledTerritories.push(territory.id);
+    nation.population += territory.population * populationShare;
+    nation.gdp += territory.gdp * gdpShare * territory.infrastructure * (1 - territory.unrest * 0.28);
+  };
+
+  for (const territory of state.territories) {
+    const subdivisions = territory.subdivisions || [];
+    const official = state.nations.get(territory.ownerId);
+    const splitControl = subdivisions.length && subdivisions.some((subdivision) => subdivision.ownerId !== territory.ownerId);
+
+    if (!subdivisions.length || !splitControl) {
+      if (official) {
+        addShare(territory.ownerId, territory, 1, 1, true);
+        official.controlledSubdivisions += Math.max(1, subdivisions.length || 1);
+      }
+      continue;
+    }
+
+    if (official && !official.territories.includes(territory.id)) official.territories.push(territory.id);
+    const shares = new Map();
+    const fallbackShare = 1 / Math.max(1, subdivisions.length);
+    for (const subdivision of subdivisions) {
+      const ownerId = subdivision.ownerId ?? territory.ownerId;
+      if (ownerId == null) continue;
+      const data = shares.get(ownerId) || { populationShare: 0, gdpShare: 0, count: 0 };
+      data.populationShare += subdivision.populationShare || fallbackShare;
+      data.gdpShare += subdivision.gdpShare || fallbackShare;
+      data.count += 1;
+      shares.set(ownerId, data);
+    }
+
+    for (const [ownerId, data] of shares) {
+      addShare(ownerId, territory, data.populationShare, data.gdpShare, ownerId === territory.ownerId);
+      const controller = state.nations.get(ownerId);
+      if (controller) controller.controlledSubdivisions += data.count;
+    }
   }
 
   for (const nation of state.nations.values()) {
-    if (!nation.territories.length) {
+    if (!nation.controlledSubdivisions && !nation.controlledTerritories.length) {
       nation.alive = false;
       nation.army = Math.max(0, nation.army * 0.85);
       continue;
     }
     const capital = state.territories[nation.capitalId];
-    if (!capital || capital.ownerId !== nation.id) {
-      nation.capitalId = nation.territories
+    const capitalControlled = capital?.subdivisions?.length
+      ? subdivisionControlCount(capital, nation.id) > 0
+      : capital?.ownerId === nation.id;
+    if (!capitalControlled) {
+      const holdings = (nation.territories.length ? nation.territories : nation.controlledTerritories)
         .slice()
-        .sort((a, b) => state.territories[b].gdp - state.territories[a].gdp)[0];
+        .filter((id) => state.territories[id]);
+      nation.capitalId = holdings.sort((a, b) => state.territories[b].gdp - state.territories[a].gdp)[0] ?? nation.capitalId;
     }
     nation.nameIdeas = nationNameIdeas(nation);
   }
 
-  const alive = [...state.nations.values()].filter((nation) => nation.territories.length);
+  const alive = [...state.nations.values()].filter((nation) => nation.alive && (nation.controlledSubdivisions || nation.controlledTerritories.length));
   const maxGdp = Math.max(1, ...alive.map((nation) => nation.gdp));
   const maxPopulation = Math.max(1, ...alive.map((nation) => nation.population));
   const maxArmy = Math.max(1, ...alive.map((nation) => nation.army));
-  const maxTerritories = Math.max(1, ...alive.map((nation) => nation.territories.length));
+  const maxTerritories = Math.max(1, ...alive.map((nation) => nation.controlledTerritories?.length || nation.territories.length));
 
   for (const nation of alive) {
     const treatyScore = clamp((nation.allies.size * 9 + nation.puppets.size * 7 - nation.rivals.size * 4) / 36, 0, 1);
     const budgetHealth = clamp((nation.income - nation.expenses + 40) / 100, 0, 1);
+    const controlledCount = nation.controlledTerritories?.length || nation.territories.length;
     nation.economicScore = clamp(
       (relativeLog(nation.gdp, maxGdp) * 0.58 + budgetHealth * 0.22 + nation.tech * 0.2) * 100,
       0,
@@ -1629,7 +1775,7 @@ function recalculateNationStats() {
     );
     nation.diplomaticScore = clamp((nation.ideology.diplomacy * 0.48 + treatyScore * 0.34 + (nation.overlordId ? 0.08 : 0.18)) * 100, 0, 100);
     nation.geopoliticalScore = clamp(
-      (relativeLog(nation.territories.length, maxTerritories) * 0.42 + relativeLog(nation.population, maxPopulation) * 0.28 + nation.ambition * 0.16 + nation.stability * 0.14) * 100,
+      (relativeLog(controlledCount, maxTerritories) * 0.42 + relativeLog(nation.population, maxPopulation) * 0.28 + nation.ambition * 0.16 + nation.stability * 0.14) * 100,
       0,
       100,
     );
@@ -1711,6 +1857,7 @@ function advanceTime(hours = state.timeStepHours) {
   tryPeacefulUnifications(monthScale);
   evolveNationNames(monthScale);
   processWars(monthScale);
+  reconcileSubdivisionOwnership();
   decayInactiveFronts(monthScale);
   processRevolts(monthScale);
   recalculateNationStats();
@@ -1744,11 +1891,13 @@ function updateEconomy(monthScale = 1) {
       if (owner.wars.has(neighborOwner.id)) return sum - 0.28;
       return sum + clamp((getRelation(owner.id, neighborOwner.id) + 40) / 520, -0.08, 0.16);
     }, 0);
-    const tradeBonus = clamp(tradeAccess / Math.max(1, territory.neighbors.length), -0.18, 0.2);
+    const hostileNeighborCount = territory.neighbors.reduce((sum, id) => sum + (owner.wars.has(state.territories[id]?.ownerId) ? 1 : 0), 0);
+    const tradeBonus = clamp(tradeAccess / Math.max(1, territory.neighbors.length) - (atWar ? 0.04 + hostileNeighborCount * 0.018 : 0), -0.26, 0.2);
     const debtDrag = owner.treasury < -150 ? 0.004 : 0;
     const ideologyGrowth = owner.ideology.economy * 0.006;
-    const peaceBonus = atWar ? -0.006 : 0.004;
-    const instabilityDrag = territory.unrest * 0.008 + owner.warExhaustion * 0.0018 + debtDrag;
+    const warTradePenalty = atWar ? clamp(0.009 + owner.wars.size * 0.004 + owner.warExhaustion * 0.01 + hostileNeighborCount * 0.003, 0, 0.045) : 0;
+    const peaceBonus = atWar ? -0.01 - owner.warExhaustion * 0.004 : 0.004;
+    const instabilityDrag = territory.unrest * 0.01 + owner.warExhaustion * (atWar ? 0.006 : 0.002) + territory.occupation * 0.004 + warTradePenalty + debtDrag;
     const growth = clamp(
       (ideologyGrowth + peaceBonus + tradeBonus * 0.012 - instabilityDrag) * monthScale + (rng() - 0.48) * 0.004 * volatility,
       -0.018 * Math.max(monthScale, 0.08),
@@ -2024,12 +2173,10 @@ function warDesire(a, b, pair) {
   const aggression = (a.ideology.aggression + b.ideology.aggression + a.ambition + b.ambition) / 4;
   const geoEco = geoeconomicPressure(a, b, pair);
   const relationPenalty = Math.max(0, -relation - 62);
-  const isIslandWar = pair.fronts.length === 0 && (
-    a.territories.some(id => state.territories[id].subregion === "Caribbean") ||
-    b.territories.some(id => state.territories[id].subregion === "Caribbean")
+  const isIslandWar = pair.fronts.some(([leftId, rightId]) =>
+    state.territories[leftId]?.maritimeNeighbors?.includes(rightId) || state.territories[rightId]?.maritimeNeighbors?.includes(leftId),
   );
-  const islandBonus = isIslandWar ? 0.005 : 0;
-  return clamp(
+  const islandBonus = isIslandWar ? 0.014 : 0;  return clamp(
     0.006 +
       aggression * 0.035 +
       strengthGap * 0.02 +
@@ -2072,6 +2219,34 @@ function breakAlliance(aId, bId, reason) {
   pushEvent("diplomacy", `${a.name} and ${b.name} end their alliance after ${reason}.`);
 }
 
+function closestTerritoryPairBetweenNations(a, b) {
+  let best = null;
+  for (const aId of a.controlledTerritories?.length ? a.controlledTerritories : a.territories) {
+    const left = state.territories[aId];
+    if (!left) continue;
+    for (const bId of b.controlledTerritories?.length ? b.controlledTerritories : b.territories) {
+      const right = state.territories[bId];
+      if (!right) continue;
+      const distance = haversine(left.geoCentroid, right.geoCentroid);
+      const neighborBonus = left.neighbors.includes(right.id) ? 0.55 : 1;
+      const score = distance * neighborBonus;
+      if (!best || score < best.score) best = { left, right, score, distance };
+    }
+  }
+  return best;
+}
+
+function ensureWarBorderPair(attacker, defender) {
+  const key = pairKey(attacker.id, defender.id);
+  const existing = state.borderPairs.get(key);
+  if (existing?.fronts?.length) return existing;
+  const best = closestTerritoryPairBetweenNations(attacker, defender);
+  const pair = existing || { a: attacker.id, b: defender.id, fronts: [] };
+  if (best) pair.fronts = [[best.left.id, best.right.id]];
+  state.borderPairs.set(key, pair);
+  return pair;
+}
+
 function startWar(attackerId, defenderId, reason) {
   if (attackerId === defenderId) return false;
   const attacker = state.nations.get(attackerId);
@@ -2090,35 +2265,14 @@ function startWar(attackerId, defenderId, reason) {
     reason,
     [`${attackerId}Territories`]: Math.max(1, attacker.territories.length),
     [`${defenderId}Territories`]: Math.max(1, defender.territories.length),
+    [`${attackerId}Subdivisions`]: Math.max(1, totalSubdivisionControlCount(attackerId)),
+    [`${defenderId}Subdivisions`]: Math.max(1, totalSubdivisionControlCount(defenderId)),
   };
   attacker.wars.set(defenderId, { ...warState });
   defender.wars.set(attackerId, { ...warState });
   adjustRelation(attackerId, defenderId, -34);
+  ensureWarBorderPair(attacker, defender);
   seedWarFronts(attacker, defender);
-
-  // For island wars, create a dummy border pair if none exists
-  if (!state.borderPairs.has(pairKey(attackerId, defenderId))) {
-    const dummyFronts = [];
-    // Create dummy fronts between capitals or random territories
-    const aTerr = state.territories[attacker.capitalId] || state.territories[attacker.territories[0]];
-    const bTerr = state.territories[defender.capitalId] || state.territories[defender.territories[0]];
-    if (aTerr && bTerr) {
-      dummyFronts.push([aTerr.id, bTerr.id]);
-    }
-    state.borderPairs.set(pairKey(attackerId, defenderId), { a: attackerId, b: defenderId, fronts: dummyFronts });
-  }
-
-  // For island wars, create a dummy border pair if none exists
-  if (!state.borderPairs.has(pairKey(attackerId, defenderId))) {
-    const dummyFronts = [];
-    // Create dummy fronts between capitals or random territories
-    const aTerr = state.territories[attacker.capitalId] || state.territories[attacker.territories[0]];
-    const bTerr = state.territories[defender.capitalId] || state.territories[defender.territories[0]];
-    if (aTerr && bTerr) {
-      dummyFronts.push([aTerr.id, bTerr.id]);
-    }
-    state.borderPairs.set(pairKey(attackerId, defenderId), { a: attackerId, b: defenderId, fronts: dummyFronts });
-  }
 
   for (const allyId of attacker.allies) {
     const ally = state.nations.get(allyId);
@@ -2128,9 +2282,12 @@ function startWar(attackerId, defenderId, reason) {
         reason: "allied intervention",
         [`${ally.id}Territories`]: Math.max(1, ally.territories.length),
         [`${defender.id}Territories`]: Math.max(1, defender.territories.length),
+        [`${ally.id}Subdivisions`]: Math.max(1, totalSubdivisionControlCount(ally.id)),
+        [`${defender.id}Subdivisions`]: Math.max(1, totalSubdivisionControlCount(defender.id)),
       };
       ally.wars.set(defenderId, { ...allyWarState });
       defender.wars.set(ally.id, { ...allyWarState });
+      ensureWarBorderPair(ally, defender);
       seedWarFronts(ally, defender);
       // territory visuals may change as allied wars seed fronts
       state.fillCacheDirty = true;
@@ -2589,33 +2746,91 @@ function transferTerritory(territoryId, toNationId, { reason = "annexed", event 
   state.fillCacheDirty = true;
 }
 
+function dominantSubdivisionOwner(territory) {
+  if (!territory?.subdivisions?.length) return territory?.ownerId != null ? { ownerId: territory.ownerId, ratio: 1, count: 1 } : null;
+  const totals = new Map();
+  for (const subdivision of territory.subdivisions) {
+    const ownerId = subdivision.ownerId ?? territory.ownerId;
+    if (ownerId == null) continue;
+    const current = totals.get(ownerId) || { count: 0, weight: 0 };
+    current.count += 1;
+    current.weight += subdivision.populationShare || 1 / territory.subdivisions.length;
+    totals.set(ownerId, current);
+  }
+  let best = null;
+  for (const [ownerId, data] of totals) {
+    if (!best || data.weight > best.weight || (data.weight === best.weight && data.count > best.count)) {
+      best = { ownerId, count: data.count, weight: data.weight };
+    }
+  }
+  if (!best) return null;
+  return { ownerId: best.ownerId, count: best.count, ratio: clamp(best.weight, 0, 1) };
+}
+
+function reconcileSubdivisionOwnership() {
+  for (const territory of state.territories) {
+    if (!territory.subdivisions?.length || territory.ownerId == null) continue;
+    const dominant = dominantSubdivisionOwner(territory);
+    if (!dominant || dominant.ownerId === territory.ownerId) continue;
+    const currentHeld = subdivisionControlCount(territory, territory.ownerId);
+    const required = territory.subdivisions.length <= 2 ? 1 : 0.76;
+    const completeLoss = currentHeld === 0;
+    const sustainedBreakthrough = dominant.ratio >= required && (territory.contestedProgress >= 0.82 || territory.contestedById === dominant.ownerId);
+    if (!completeLoss && !sustainedBreakthrough) continue;
+    const previous = state.nations.get(territory.ownerId);
+    const controller = state.nations.get(dominant.ownerId);
+    if (!controller?.alive) continue;
+    transferTerritory(territory.id, dominant.ownerId, {
+      reason: "captured",
+      quiet: true,
+    });
+    if (previous?.alive) pushEvent("war", `${controller.name} secures full control of ${territory.originalName} from ${previous.name}.`);
+  }
+}
+
 function maybeResolveWar(a, b, duration, monthScale = 1) {
   recalculateNationStats();
   const weaker = a.power < b.power ? a : b;
   const stronger = weaker.id === a.id ? b : a;
   const weakerCapital = state.territories[weaker.capitalId];
-  const capitalLost = !weakerCapital || weakerCapital.ownerId !== weaker.id;
+  const capitalLost = !weakerCapital || subdivisionControlCount(weakerCapital, weaker.id) === 0 || weakerCapital.ownerId !== weaker.id;
   const warMeta = weaker.wars.get(stronger.id) || stronger.wars.get(weaker.id) || {};
-  const originalWeakerTerritories = Math.max(1, warMeta[`${weaker.id}Territories`] || weaker.territories.length);
-  const occupiedShare = clamp((originalWeakerTerritories - weaker.territories.length) / originalWeakerTerritories, 0, 1);
-  const seriousOccupation = occupiedShare >= 0.34 || (capitalLost && occupiedShare >= 0.18);
+  const originalWeakerTerritories = Math.max(1, warMeta[`${weaker.id}Territories`] || weaker.territories.length || weaker.controlledTerritories?.length || 1);
+  const originalWeakerSubdivisions = Math.max(1, warMeta[`${weaker.id}Subdivisions`] || totalSubdivisionControlCount(weaker.id) || originalWeakerTerritories);
+  const territoryLostShare = clamp((originalWeakerTerritories - weaker.territories.length) / originalWeakerTerritories, 0, 1);
+  const subdivisionLostShare = clamp((originalWeakerSubdivisions - totalSubdivisionControlCount(weaker.id)) / originalWeakerSubdivisions, 0, 1);
+  const occupiedShare = Math.max(territoryLostShare, subdivisionLostShare);
+  const powerRatio = stronger.power / Math.max(1, weaker.power);
+  const armyRatio = stronger.army / Math.max(0.5, weaker.army);
+  const seriousOccupation = occupiedShare >= 0.28 || (capitalLost && occupiedShare >= 0.12);
+  const weakEnoughToSubmit = powerRatio > 2.15 && (armyRatio > 1.6 || weaker.warExhaustion > 0.58) && occupiedShare >= 0.18;
   const collapseRisk =
-    (seriousOccupation && stronger.power / Math.max(1, weaker.power) > 1.85 ? 0.16 : 0) +
-    (capitalLost ? 0.16 : 0) +
-    (weaker.warExhaustion > 0.72 ? 0.12 : 0) +
-    (occupiedShare > 0.5 ? 0.18 : 0);
+    (seriousOccupation && powerRatio > 1.65 ? 0.18 : 0) +
+    (weakEnoughToSubmit ? 0.16 : 0) +
+    (capitalLost ? 0.18 : 0) +
+    (weaker.warExhaustion > 0.72 ? 0.14 : 0) +
+    (occupiedShare > 0.5 ? 0.2 : 0);
 
-  if (duration > 1.5 && seriousOccupation && rng() < scaledChance(collapseRisk, monthScale)) {
-    const annexationThreshold = 0.55 - stronger.ideology.aggression * 0.2; // Aggressive nations annex at lower occupation levels
-    if (occupiedShare > annexationThreshold || (capitalLost && stronger.ideology.aggression > 0.72)) {
-      const territories = weaker.territories.slice();
+  if (duration > 0.6 && (seriousOccupation || weakEnoughToSubmit) && rng() < scaledChance(collapseRisk, monthScale)) {
+    const annexPreference = clamp(
+      0.22 + stronger.ideology.aggression * 0.58 + stronger.ambition * 0.2 - stronger.ideology.diplomacy * 0.24 + (stronger.ideology.name === "Military" ? 0.12 : 0),
+      0.08,
+      0.92,
+    );
+    const shouldAnnex =
+      occupiedShare > 0.72 ||
+      (capitalLost && occupiedShare > 0.34) ||
+      (weakEnoughToSubmit && rng() < annexPreference) ||
+      rng() < annexPreference * 0.55;
+    if (shouldAnnex) {
+      const territories = [...new Set([...(weaker.territories || []), ...(weaker.controlledTerritories || [])])];
       for (const territoryId of territories) {
         transferTerritory(territoryId, stronger.id, { quiet: true });
       }
       endWar(a.id, b.id, `${weaker.name} collapses and is annexed by ${stronger.name}.`);
     } else {
       makePuppet(weaker.id, stronger.id);
-      endWar(a.id, b.id, `${weaker.name} accepts puppet status under ${stronger.name} after losing ${Math.round(occupiedShare * 100)}% of its territory.`);
+      endWar(a.id, b.id, `${weaker.name} submits to ${stronger.name} as a puppet after losing ${Math.round(occupiedShare * 100)}% of its subdivisions.`);
     }
     return;
   }
@@ -2821,6 +3036,39 @@ function checkNearbyMilitaryPresence(territory, ownerId, checkDistance = 3) {
   return clamp(totalFriendlyArmy / 250, 0, 1);
 }
 
+function dominantReligionForNationState(nation) {
+  const counts = new Map();
+  const territoryIds = nation.controlledTerritories?.length ? nation.controlledTerritories : nation.territories;
+  for (const id of territoryIds || []) {
+    const territory = state.territories[id];
+    if (!territory?.religion) continue;
+    counts.set(territory.religion, (counts.get(territory.religion) || 0) + (territory.population || 1));
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || "Secular";
+}
+
+function ideologySimilarityScore(a, b) {
+  const aggression = 1 - Math.abs(a.ideology.aggression - b.ideology.aggression);
+  const economy = 1 - Math.abs(a.ideology.economy - b.ideology.economy);
+  const diplomacy = 1 - Math.abs(a.ideology.diplomacy - b.ideology.diplomacy);
+  return clamp((aggression * 0.44 + economy * 0.28 + diplomacy * 0.28), 0, 1);
+}
+
+function geographicProximityScore(a, b) {
+  if (state.borderPairs.has(pairKey(a.id, b.id))) return 1;
+  const best = closestTerritoryPairBetweenNations(a, b);
+  if (!best) return 0;
+  return clamp(1 - best.distance / 2600, 0, 1);
+}
+
+function culturalCompatibilityScore(a, b) {
+  const religionA = dominantReligionForNationState(a);
+  const religionB = dominantReligionForNationState(b);
+  if (religionA === religionB) return 1;
+  if (religionA === "Secular" || religionB === "Secular") return 0.45;
+  return 0.12;
+}
+
 function tryPeacefulUnifications(monthScale = 1) {
   const nations = liveNations();
   for (let i = 0; i < nations.length; i += 1) {
@@ -2835,20 +3083,12 @@ function tryPeacefulUnifications(monthScale = 1) {
       const combinedAmbition = (a.ambition + b.ambition) / 2;
       const powerRatio = Math.max(a.power / Math.max(1, b.power), b.power / Math.max(1, a.power));
       
-      // Cultural and ideological bonuses for unification
-      const sameReligion = a.religion === b.religion ? 0.015 : 0;
-      const ideologicalSimilarity = 1 - Math.abs(a.ideology.aggression - b.ideology.aggression);
-      const ideologyBonus = ideologicalSimilarity * 0.01;
-      
-      // Geographic proximity bonus (same continent)
-      const aContinents = new Set(a.territories.map(tid => state.territories[tid]?.continent));
-      const bContinents = new Set(b.territories.map(tid => state.territories[tid]?.continent));
-      const sharedContinents = [...aContinents].filter(c => bContinents.has(c)).length;
-      const continentBonus = sharedContinents > 0 ? 0.008 : 0;
+      const religionBonus = culturalCompatibilityScore(a, b) * 0.018;
+      const ideologyBonus = ideologySimilarityScore(a, b) * 0.014;
+      const proximityBonus = geographicProximityScore(a, b) * 0.018;
       
       const base = 0.006;
-      const chance = base + clamp((relation - 72) / 240, 0, 0.06) - combinedAmbition * 0.01 + (powerRatio > 2 ? 0.02 : 0) + sameReligion + ideologyBonus + continentBonus;
-      if (rng() < scaledChance(chance, monthScale)) {
+      const chance = base + clamp((relation - 72) / 240, 0, 0.06) - combinedAmbition * 0.01 + (powerRatio > 2 ? 0.02 : 0) + religionBonus + ideologyBonus + proximityBonus;      if (rng() < scaledChance(chance, monthScale)) {
         const absorber = a.power >= b.power ? a : b;
         const absorbed = absorber.id === a.id ? b : a;
         for (const tid of absorbed.territories.slice()) {
@@ -2863,6 +3103,7 @@ function tryPeacefulUnifications(monthScale = 1) {
 }
 
 function cleanupDefeatedNations() {
+  reconcileSubdivisionOwnership();
   for (const nation of state.nations.values()) {
     if (totalSubdivisionControlCount(nation.id) > 0) continue;
     if (nation.alive) pushEvent("diplomacy", `${nation.name} leaves the world stage.`);
@@ -2878,7 +3119,7 @@ function cleanupDefeatedNations() {
 }
 
 function liveNations() {
-  return [...state.nations.values()].filter((nation) => nation.alive && nation.territories.length);
+  return [...state.nations.values()].filter((nation) => nation.alive && (nation.territories.length || totalSubdivisionControlCount(nation.id) > 0));
 }
 
 function worldMonthIndex() {
@@ -3022,7 +3263,7 @@ function renderMap() {
   }
   state.cachedMaxPopulation = maxPop;
   state.cachedMaxGdp = maxGdp;
-  // Avoid rebuilding territory path geometry every frame — only when projection/view changes
+  // Avoid rebuilding territory path geometry every frame - only when projection/view changes
   // `rebuildPaths` set above when background was rebuilt
   const offscreenMargin = 96;
   if (rebuildPaths) {
@@ -3267,32 +3508,6 @@ function currentSegmentOwnerMap() {
       }
       entry.owners.add(territory.ownerId);
       entry.territories.add(territory.id);
-    }
-
-    // include subdivision-level geo segments when available (admin1 geometry)
-    if (territory.subdivisions?.length) {
-      for (const s of territory.subdivisions) {
-        if (!s.geoRings || !s.projectedRings) continue;
-        for (let r = 0; r < s.geoRings.length; r += 1) {
-          const lonLatRing = s.geoRings[r];
-          const projRing = s.projectedRings[r];
-          if (!lonLatRing || !projRing || lonLatRing.length < 2) continue;
-          for (let i = 0; i < lonLatRing.length; i += 1) {
-            const next = (i + 1) % lonLatRing.length;
-            const key = segmentKeyFromLonLat(lonLatRing[i], lonLatRing[next]);
-            const a = projRing[i];
-            const b = projRing[next];
-            const segObj = { key, a, b };
-            let entry = segments.get(key);
-            if (!entry) {
-              entry = { segment: segObj, owners: new Set(), territories: new Set() };
-              segments.set(key, entry);
-            }
-            entry.owners.add(s.ownerId);
-            entry.territories.add(territory.id);
-          }
-        }
-      }
     }
   }
 
@@ -3736,6 +3951,10 @@ function drawSubdivisionControlCells(territory, controllerId, color) {
 function drawContestedTerritories() {
   for (const territory of state.territories) {
     if (!territory.path || !territory.subdivisions?.length) continue;
+    const hasSubdivisionVisual =
+      territory.captureFlash > 0.01 ||
+      territory.subdivisions.some((s) => (s.contestedById && s.contestedProgress > 0.01) || s.ownerId !== territory.ownerId);
+    if (!hasSubdivisionVisual) continue;
     const bounds = screenBoundsForTerritory(territory);
     const projectedCenter = territory.centroid || [0, 0];
     const radius = Math.max(bounds.width, bounds.height) * 0.7;
@@ -3952,19 +4171,21 @@ function drawSelectionHalo() {
     ctx.stroke(hovered.path);
     ctx.restore();
   }
-    if (selected?.ownerId) {
-    const owner = state.nations.get(selected.ownerId);
-    if (owner?.territories?.length) {
+  const selectedOwnerId = state.selectedNationId ?? selected?.ownerId;
+  if (selectedOwnerId) {
+    const owner = state.nations.get(selectedOwnerId);
+    const ownerTerritoryIds = owner?.controlledTerritories?.length ? owner.controlledTerritories : owner?.territories || [];
+    if (ownerTerritoryIds.length) {
       ctx.save();
       ctx.globalAlpha = 0.1;
-        ctx.fillStyle = "rgba(255,255,255,0.1)";
-      for (const territoryId of owner.territories) {
+      ctx.fillStyle = "rgba(255,255,255,0.1)";
+      for (const territoryId of ownerTerritoryIds) {
         const territory = state.territories[territoryId];
         if (territory?.path) ctx.fill(territory.path, "evenodd");
       }
       ctx.restore();
     }
-    drawOwnerBoundary(selected.ownerId);
+    drawOwnerBoundary(selectedOwnerId);
   }
 }
 
@@ -4062,9 +4283,38 @@ function drawLabels() {
   ctx.restore();
 }
 
+function selectedSubdivision() {
+  const territory = state.territories[state.selectedTerritoryId];
+  if (!territory?.subdivisions?.length || !state.selectedSubdivisionId) return null;
+  return territory.subdivisions.find((subdivision) => subdivision.id === state.selectedSubdivisionId) || null;
+}
+
+function ownerHistoryLinks(ownerIds) {
+  return ownerIds
+    .filter((id) => id != null)
+    .filter((id, idx, list) => list.indexOf(id) === idx || idx === list.length - 1)
+    .map((id, idx, list) => {
+      const label = escapeHtml(state.nations.get(id)?.name || "Unknown");
+      const sep = idx < list.length - 1 ? " -> " : "";
+      return '<a href="#" class="link-nation" data-nation-id="' + id + '">' + label + '</a>' + sep;
+    })
+    .join("");
+}
+
+function neighboringNationsForTerritory(territory, ownerId) {
+  if (!territory) return [];
+  return territory.neighbors
+    .map((id) => state.nations.get(state.territories[id]?.ownerId))
+    .filter((item) => item?.alive && item.id !== ownerId)
+    .filter((item, index, list) => list.findIndex((other) => other.id === item.id) === index)
+    .sort((a, b) => getRelation(ownerId, a.id) - getRelation(ownerId, b.id));
+}
+
 function renderSelection() {
   const territory = state.territories[state.selectedTerritoryId];
-  const nation = territory ? state.nations.get(territory.ownerId) : state.nations.get(state.selectedNationId);
+  const sub = selectedSubdivision();
+  const effectiveOwnerId = sub?.ownerId ?? territory?.ownerId ?? state.selectedNationId;
+  const nation = territory ? state.nations.get(effectiveOwnerId) : state.nations.get(state.selectedNationId);
   els.selectedBadge.textContent = territory ? territory.iso : "None";
   els.aiBadge.textContent = nation ? nation.ideology.name : "Autonomous";
 
@@ -4082,31 +4332,23 @@ function renderSelection() {
     return;
   }
 
-  const relations = territory.neighbors
-    .map((id) => state.nations.get(state.territories[id].ownerId))
-    .filter((item) => item && item.id !== nation.id)
-    .filter((item, index, list) => list.findIndex((other) => other.id === item.id) === index)
-    .sort((a, b) => getRelation(nation.id, a.id) - getRelation(nation.id, b.id));
+  const relations = neighboringNationsForTerritory(territory, nation.id);
 
   const originalOwner = state.nations.get(territory.originalOwnerId);
   const wasConquered = territory.originalOwnerId != null && territory.ownerId !== territory.originalOwnerId;
   const subdivisionCount = territory.subdivisions?.length || 0;
-  const heldByOwner = subdivisionControlCount(territory, territory.ownerId);
-  const ownerHistory = territory.ownerHistory?.length
-    ? territory.ownerHistory
-    : [territory.originalOwnerId, territory.ownerId].filter((id) => id != null);
-  const historyLine = ownerHistory
-    .map((id, idx) => {
-      const label = escapeHtml(state.nations.get(id)?.name || "Unknown");
-      const sep = idx < ownerHistory.length - 1 ? " -> " : "";
-      return '<a href="#" class="link-nation" data-nation-id="' + id + '">' + label + '</a>' + sep;
-    })
-    .join("");
-
+  const heldByOwner = subdivisionControlCount(territory, nation.id);
+  const ownerHistory = sub?.history?.length
+    ? sub.history
+    : territory.ownerHistory?.length
+      ? territory.ownerHistory
+      : [territory.originalOwnerId, territory.ownerId].filter((id) => id != null);
+  const historyLine = ownerHistoryLinks(ownerHistory);
   els.selectionDetails.innerHTML = detailRows([
     ["Territory", territory.name],
     ["Original", territory.originalName],
     ["Owner", nation.name],
+    ["Subdivision", sub ? `${sub.name} (${sub.type})` : "Whole territory"],
     ["Status", wasConquered ? "Conquered" : "Sovereign"],
     ["Rating", `${nation.ratingGrade} ${nation.rating.toFixed(0)}/100`],
     ["Ideology", nation.ideology.name],
@@ -4115,13 +4357,13 @@ function renderSelection() {
     ["Region", territory.region],
     ["Population", formatPopulation(territory.population)],
     ["GDP", formatMoney(territory.gdp)],
-    ["Subdivisions", subdivisionCount ? heldByOwner + "/" + subdivisionCount + " held" : "N/A"],
+    ["Subdivisions", subdivisionCount ? heldByOwner + "/" + subdivisionCount + " controlled by " + nation.name : "N/A"],
     ["Unrest", Math.round(territory.unrest * 100) + "%"],
     ["Fortified", Math.round(territory.fortification * 100) + "%"],
     ["Treasury", nation.treasury.toFixed(0) + " credits"],
     ["Army", nation.army.toFixed(1) + " brigades"],
     ["Wars", String(nation.wars.size)],
-    ["Neighbors", relations.slice(0, 2).map((item) => item.name).join(", ") || "Internal"],
+    ["Neighbors", relations.slice(0, 3).map((item) => item.name).join(", ") || "No foreign neighbors"],
   ]);
   els.selectionDetails.innerHTML += '<div class="detail-row"><span>Historical Owners</span><strong>' + historyLine + '</strong></div>';
   els.selectionDetails.innerHTML += fullDetailRow("Admin-1 Detail", subdivisionSummary(territory));
@@ -4162,7 +4404,7 @@ function subdivisionSummary(territory) {
     .slice()
     .sort((a, b) => b.populationShare - a.populationShare)
     .slice(0, 5)
-    .map((subdivision) => `${subdivision.name} (${formatPopulation(territory.population * subdivision.populationShare)})`)
+    .map((subdivision) => `${subdivision.name} - ${state.nations.get(subdivision.ownerId)?.name || "Unclaimed"} (${formatPopulation(territory.population * subdivision.populationShare)})`)
     .join(", ");
 }
 
@@ -4395,11 +4637,13 @@ function syncControls() {
   }[state.activeTool];
 }
 
-function selectTerritory(id) {
+function selectTerritory(id, subdivisionId = null) {
   const territory = state.territories[id];
   if (!territory) return;
+  const subdivision = subdivisionId ? territory.subdivisions?.find((item) => item.id === subdivisionId) : null;
   state.selectedTerritoryId = id;
-  state.selectedNationId = territory.ownerId;
+  state.selectedSubdivisionId = subdivision?.id ?? null;
+  state.selectedNationId = subdivision?.ownerId ?? territory.ownerId;
   renderAll();
 }
 
@@ -4411,15 +4655,37 @@ function territoryAt(x, y) {
   return null;
 }
 
+function subdivisionAt(territory, x, y) {
+  if (!territory?.subdivisions?.length) return null;
+  for (let i = territory.subdivisions.length - 1; i >= 0; i -= 1) {
+    const subdivision = territory.subdivisions[i];
+    if (subdivision.path && ctx.isPointInPath(subdivision.path, x, y, "evenodd")) return subdivision;
+  }
+  return null;
+}
+
+function mapSelectionAt(x, y) {
+  const territory = territoryAt(x, y);
+  if (!territory) return null;
+  const subdivision = subdivisionAt(territory, x, y);
+  return {
+    territory,
+    subdivision,
+    ownerId: subdivision?.ownerId ?? territory.ownerId,
+  };
+}
+
 function handleMapClick(event) {
   const point = canvasPoint(event);
-  const territory = territoryAt(point.x, point.y);
+  const hit = mapSelectionAt(point.x, point.y);
+  const territory = hit?.territory || null;
   
   // Click on ocean deselects current selection
   if (!territory) {
     if (state.activeTool === "inspect") {
       state.selectedTerritoryId = null;
       state.selectedNationId = null;
+      state.selectedSubdivisionId = null;
       renderAll();
       renderMap();
     }
@@ -4427,13 +4693,13 @@ function handleMapClick(event) {
   }
 
   if (state.activeTool === "inspect") {
-    selectTerritory(territory.id);
+    selectTerritory(territory.id, hit.subdivision?.id ?? null);
     return;
   }
-  
+
   // Wars & Alliances mode: show war/alliance info
   if (state.mapMode === "warAlliances") {
-    selectTerritory(territory.id);
+    selectTerritory(territory.id, hit.subdivision?.id ?? null);
     return;
   }
 
@@ -4515,29 +4781,55 @@ function fundRebelsSelection() {
   renderAll();
 }
 
+function candidateWarTargetsForTerritory(territory, owner) {
+  if (!territory || !owner) return [];
+  const byNation = new Map();
+  const addCandidate = (nation, territoryRef, distance = 0, maritime = false) => {
+    if (!nation?.alive || nation.id === owner.id || owner.allies.has(nation.id)) return;
+    const relation = getRelation(owner.id, nation.id);
+    const seaPenalty = maritime ? 8 : 0;
+    const score = relation + seaPenalty + distance / 90 - nation.power / Math.max(1, owner.power + nation.power) * 8;
+    const existing = byNation.get(nation.id);
+    if (!existing || score < existing.score) byNation.set(nation.id, { nation, territory: territoryRef, distance, score, maritime });
+  };
+
+  for (const neighborId of territory.neighbors || []) {
+    const neighbor = state.territories[neighborId];
+    const nation = state.nations.get(neighbor?.ownerId);
+    const maritime = territory.maritimeNeighbors?.includes(neighborId);
+    addCandidate(nation, neighbor, neighbor ? haversine(territory.geoCentroid, neighbor.geoCentroid) : 0, maritime);
+  }
+
+  const seaLimit = isIslandLikeTerritory(territory) ? 2600 : 1450;
+  for (const other of state.territories) {
+    if (other.id === territory.id) continue;
+    const nation = state.nations.get(other.ownerId);
+    if (!nation?.alive || nation.id === owner.id) continue;
+    const distance = haversine(territory.geoCentroid, other.geoCentroid);
+    if (distance > seaLimit) continue;
+    addCandidate(nation, other, distance, true);
+  }
+
+  return [...byNation.values()].sort((a, b) => a.score - b.score);
+}
+
 function inciteWarSelection() {
   const territory = state.territories[state.selectedTerritoryId];
   if (!territory) return;
-  const owner = state.nations.get(territory.ownerId);
-  const targets = territory.neighbors
-    .map((id) => state.nations.get(state.territories[id].ownerId))
-    .filter((nation) => nation?.alive && nation.id !== owner.id)
-    .filter((nation, index, list) => list.findIndex((item) => item.id === nation.id) === index)
-    .sort((a, b) => getRelation(owner.id, a.id) - getRelation(owner.id, b.id));
-  const target = targets[0];
-  if (!target) return;
+  const sub = selectedSubdivision();
+  const owner = state.nations.get(sub?.ownerId ?? territory.ownerId);
+  const target = candidateWarTargetsForTerritory(territory, owner)[0]?.nation;
+  if (!owner || !target) return;
   setRelation(owner.id, target.id, -88);
-  startWar(owner.id, target.id, "manufactured border crisis");
+  startWar(owner.id, target.id, "manufactured crisis");
   renderAll();
 }
-
 function puppetSelection() {
   const territory = state.territories[state.selectedTerritoryId];
   if (!territory) return;
-  const subject = state.nations.get(territory.ownerId);
-  const overlord = territory.neighbors
-    .map((id) => state.nations.get(state.territories[id].ownerId))
-    .filter((nation) => nation?.alive && nation.id !== subject.id)
+  const subject = state.nations.get(selectedSubdivision()?.ownerId ?? territory.ownerId);
+  const overlord = candidateWarTargetsForTerritory(territory, subject)
+    .map((candidate) => candidate.nation)
     .sort((a, b) => b.power - a.power)[0];
   if (!overlord) return;
   makePuppet(subject.id, overlord.id);
@@ -4555,25 +4847,29 @@ function canvasPoint(event) {
 
 function updateTooltip(event) {
   const point = canvasPoint(event);
-  const territory = territoryAt(point.x, point.y);
+  const hit = mapSelectionAt(point.x, point.y);
+  const territory = hit?.territory || null;
+  const sub = hit?.subdivision || null;
   state.hoveredTerritoryId = territory?.id ?? null;
+  state.hoveredSubdivisionId = sub?.id ?? null;
   if (!territory) {
     els.mapTooltip.hidden = true;
     renderMap();
     return;
   }
 
-  const nation = state.nations.get(territory.ownerId);
+  const nation = state.nations.get(hit.ownerId);
   const conquered = territory.originalOwnerId != null && territory.ownerId !== territory.originalOwnerId;
-  const topSubdivision = territory.subdivisions?.length
+  const topSubdivision = sub || (territory.subdivisions?.length
     ? territory.subdivisions.slice().sort((a, b) => b.populationShare - a.populationShare)[0]
-    : null;
+    : null);
   els.mapTooltip.hidden = false;
   els.mapTooltip.style.left = `${Math.min(point.x + 14, canvas.width - 252)}px`;
   els.mapTooltip.style.top = `${Math.min(point.y + 14, canvas.height - 112)}px`;
   els.mapTooltip.innerHTML = `
-    <strong>${escapeHtml(territory.name)}</strong>
+    <strong>${escapeHtml(sub?.name || territory.name)}</strong>
     ${escapeHtml(nation?.name || "Unclaimed")}<br />
+    ${sub ? `${escapeHtml(territory.originalName)} subdivision<br />` : ""}
     ${conquered ? `Originally ${escapeHtml(territory.originalName)}<br />` : ""}
     ${state.mapMode === "population" && topSubdivision ? `${escapeHtml(topSubdivision.name)} ${escapeHtml(formatPopulation(territory.population * topSubdivision.populationShare))}<br />` : ""}
     GDP ${escapeHtml(formatMoney(territory.gdp))} · Unrest ${Math.round(territory.unrest * 100)}%
@@ -4603,6 +4899,7 @@ function saveGame() {
     running: state.running,
     mapMode: state.mapMode,
     selectedTerritoryId: state.selectedTerritoryId,
+    selectedSubdivisionId: state.selectedSubdivisionId,
     territories: state.territories.map((territory) => ({
       id: territory.id,
       ownerId: territory.ownerId,
@@ -4628,7 +4925,10 @@ function saveGame() {
       subdivisionsType: territory.subdivisionsType || "Subdivision",
       subdivisionSource: territory.subdivisionSource || "unknown",
       subdivisionsTemplate: territory.subdivisionsTemplate || [],
-      subdivisions: territory.subdivisions || [],
+      subdivisions: (territory.subdivisions || []).map((subdivision) => {
+        const { path, ...rest } = subdivision;
+        return rest;
+      }),
       capital: territory.capital,
     })),
     nations: [...state.nations.values()].map((nation) => ({
@@ -4666,6 +4966,7 @@ function loadGame() {
   state.mapMode = payload.mapMode;
   // military unit toggle removed; no-op
   state.selectedTerritoryId = payload.selectedTerritoryId;
+  state.selectedSubdivisionId = payload.selectedSubdivisionId ?? null;
   state.selectedNationId = null;
   state.nations = new Map();
   state.relations = new Map(payload.relations);
@@ -4700,13 +5001,22 @@ function loadGame() {
     territory.subdivisionSource = data.subdivisionSource ?? territory.subdivisionSource ?? "unknown";
     territory.subdivisionsTemplate = data.subdivisionsTemplate ?? territory.subdivisionsTemplate ?? [];
     territory.subdivisions = data.subdivisions ?? territory.subdivisions ?? [];
+    for (const subdivision of territory.subdivisions || []) {
+      subdivision.path = null;
+      if (subdivision.geoRings && !subdivision.projectedRings) {
+        subdivision.projectedRings = subdivision.geoRings.map((ring) => ring.map(([lon, lat]) => robinsonProject(lon, lat)));
+        subdivision.centroidProjected = representativePoint(subdivision.projectedRings);
+      }
+    }
     if (!territory.subdivisions?.length) ensureTerritorySubdivisions(territory, territory.ownerId);
     updateTerritoryRulerName(territory);
   }
 
   recalculateNationStats();
   if (state.selectedTerritoryId != null) {
-    state.selectedNationId = state.territories[state.selectedTerritoryId]?.ownerId ?? null;
+    const selectedTerritory = state.territories[state.selectedTerritoryId];
+    const loadedSubdivision = selectedTerritory?.subdivisions?.find((item) => item.id === state.selectedSubdivisionId);
+    state.selectedNationId = loadedSubdivision?.ownerId ?? selectedTerritory?.ownerId ?? null;
   }
   pushEvent("diplomacy", "The saved world state is restored.");
   startLoop();
@@ -4900,3 +5210,23 @@ function boot() {
 }
 
 boot();
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
