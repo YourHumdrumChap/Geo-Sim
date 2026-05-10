@@ -51,11 +51,6 @@ If the Windows `node` app alias is blocked, use any local static server from thi
 
 ## Notes
 
-- Caribbean and other island countries can now attack and be attacked via naval invasions, allowing for more dynamic global conflicts.
-- Nations are removed from the simulation when they lose control of all their subdivisions, not just when they lose all territories.
-- Peaceful unifications now consider cultural factors like shared religion, ideological similarity, and geographic proximity.
-- War-time annexations are influenced by the victor's ideology - aggressive nations are more likely to fully annex defeated enemies rather than leaving them as puppets.
-- GDP falls during wars due to reduced trade access, increased instability, and war exhaustion penalties in the economy simulation.
 
 
 
