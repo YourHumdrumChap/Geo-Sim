@@ -154,6 +154,9 @@ const MAP_MODES = {
 };
 
 const DATA_DRIVEN_MAP_MODES = new Set(["economy", "stability", "unrest", "population"]);
+const POLITICAL_SUBDIVISION_ZOOM = 2.45;
+const POPULATION_SUBDIVISION_ZOOM = 2.05;
+const SUBDIVISION_HIT_ZOOM = 2.45;
 
 const ADMIN1_SUMMARY = window.WORLD_ADMIN1_SUMMARY || { byIso: {}, byIso3: {}, byAdmin: {}, meta: null };
 const ADMIN1_GEOMETRY = window.WORLD_ADMIN1_GEOMETRY || { byIso: {}, byIso3: {}, byAdmin: {}, meta: null };
@@ -275,6 +278,9 @@ const state = {
   lastFpsTime: 0,
   lastPanelRenderAt: 0,
   lastLeaderboardRenderAt: 0,
+  lastDataMapRenderAt: 0,
+  lastActiveVisualCheck: 0,
+  cachedActiveFrontVisuals: false,
   // unit system removed
   segmentMapCache: null,
   segmentMapDirty: false,
@@ -287,9 +293,11 @@ const state = {
   bgCanvas: null,
   lastProjectionKey: null,
   eventLinkCache: null,
+  nameIdeasDirty: true,
   // cached aggregates to avoid repeated array allocations
   cachedMaxPopulation: 1,
   cachedMaxGdp: 1,
+  cachedMaxNationGdp: 1,
 };
 
 let rng = mulberry32(state.seed);
@@ -616,6 +624,7 @@ function transferSubdivisionControl(territory, toNationId, amount = 1, preferred
   state.segmentMapDirty = true;
   // mark fill cache dirty so territorial fills update
   state.fillCacheDirty = true;
+  state.cachedActiveFrontVisuals = true;
   return moved;
 }
 
@@ -638,6 +647,7 @@ function transferSubdivision(territoryId, subdivisionIndex, toNationId, { reason
   state.segmentMapDirty = true;
   // mark fill cache dirty so territorial fills update
   state.fillCacheDirty = true;
+  state.cachedActiveFrontVisuals = true;
   return true;
 }
 
@@ -1027,6 +1037,10 @@ function initializeGame({ scenario = state.scenario, seed = Math.floor(Math.rand
   state.eventLinkCache = null;
   state.lastPanelRenderAt = 0;
   state.lastLeaderboardRenderAt = 0;
+  state.lastDataMapRenderAt = 0;
+  state.lastActiveVisualCheck = 0;
+  state.cachedActiveFrontVisuals = false;
+  state.nameIdeasDirty = true;
   clearScreenPathCaches();
   syncCalendarFromHours();
 
@@ -1566,6 +1580,7 @@ function createNation({
   };
   nation.nameHistory = [nation.name];
   state.nations.set(id, nation);
+  state.nameIdeasDirty = true;
   return nation;
 }
 
@@ -1774,14 +1789,16 @@ function recalculateNationStats() {
         .filter((id) => state.territories[id]);
       nation.capitalId = holdings.sort((a, b) => state.territories[b].gdp - state.territories[a].gdp)[0] ?? nation.capitalId;
     }
-    nation.nameIdeas = nationNameIdeas(nation);
+    if (state.nameIdeasDirty || !nation.nameIdeas?.length) nation.nameIdeas = nationNameIdeas(nation);
   }
+  state.nameIdeasDirty = false;
 
   const alive = [...state.nations.values()].filter((nation) => nation.alive && (nation.controlledSubdivisions || nation.controlledTerritories.length));
   const maxGdp = Math.max(1, ...alive.map((nation) => nation.gdp));
   const maxPopulation = Math.max(1, ...alive.map((nation) => nation.population));
   const maxArmy = Math.max(1, ...alive.map((nation) => nation.army));
   const maxTerritories = Math.max(1, ...alive.map((nation) => nation.controlledTerritories?.length || nation.territories.length));
+  state.cachedMaxNationGdp = maxGdp;
 
   for (const nation of alive) {
     const treatyScore = clamp((nation.allies.size * 9 + nation.puppets.size * 7 - nation.rivals.size * 4) / 36, 0, 1);
@@ -1793,7 +1810,13 @@ function recalculateNationStats() {
       100,
     );
     nation.militaryScore = clamp(
-      (relativeLog(nation.army, maxArmy) * 0.56 + nation.tech * 0.2 + nation.ideology.conscription * 1.15 * 0.14 + (nation.wars.size ? 0.1 : 0)) * 100,
+      (
+        relativeLog(nation.army, maxArmy) * 0.44 +
+        relativeLog(nation.gdp, maxGdp) * 0.2 +
+        nation.tech * 0.2 +
+        nation.ideology.conscription * 1.15 * 0.1 +
+        (nation.wars.size ? 0.06 : 0)
+      ) * 100,
       0,
       100,
     );
@@ -1825,10 +1848,11 @@ function recalculateNationStats() {
     );
     nation.ratingGrade = gradeForRating(nation.rating);
     nation.power =
-      nation.rating * 0.72 +
-      nation.militaryScore * 0.28 +
-      nation.economicScore * 0.2 +
-      nation.geopoliticalScore * 0.16;
+      nation.rating * 0.62 +
+      nation.militaryScore * 0.3 +
+      nation.economicScore * 0.3 +
+      nation.geoeconomicScore * 0.18 +
+      nation.geopoliticalScore * 0.14;
   }
 
   for (const nation of state.nations.values()) {
@@ -1879,7 +1903,6 @@ function advanceTime(hours = state.timeStepHours, { forceRender = false } = {}) 
   syncCalendarFromHours();
   const monthScale = stepHours / HOURS_PER_MONTH;
 
-  recalculateNationStats();
   updateEconomy(monthScale);
   updateDomesticPolitics(monthScale);
   updateDiplomacy(monthScale);
@@ -1907,30 +1930,78 @@ function syncCalendarFromHours() {
   state.hour = date.getUTCHours();
 }
 
+function economicDepth(nation, referenceGdp = state.cachedMaxNationGdp || nation.gdp || 1) {
+  return relativeLog(nation?.gdp || 0, Math.max(1, referenceGdp));
+}
+
+function fiscalHealth(nation) {
+  const operatingBalance = (nation?.income || 0) - (nation?.expenses || 0);
+  const reserves = clamp((nation?.treasury || 0) / 900, -0.45, 0.55);
+  return clamp(0.55 + operatingBalance / Math.max(80, (nation?.income || 0) * 1.8) + reserves, 0, 1.35);
+}
+
+function wartimeEconomicResilience(nation, referenceGdp = state.cachedMaxNationGdp || nation.gdp || 1) {
+  return clamp(
+    economicDepth(nation, referenceGdp) * 0.42 +
+      (nation?.tech || 0) * 0.24 +
+      (nation?.stability || 0) * 0.18 +
+      fiscalHealth(nation) * 0.16,
+    0,
+    1,
+  );
+}
+
 function updateEconomy(monthScale = 1) {
   const volatility = Math.sqrt(Math.max(monthScale, 1 / 720));
+  const maxNationalGdp = Math.max(1, state.cachedMaxNationGdp || 1);
   for (const territory of state.territories) {
     const owner = state.nations.get(territory.ownerId);
     if (!owner?.alive) continue;
     const atWar = owner.wars.size > 0;
+    const resilience = wartimeEconomicResilience(owner, maxNationalGdp);
+    const economicDepthValue = economicDepth(owner, maxNationalGdp);
     const tradeAccess = territory.neighbors.reduce((sum, id) => {
       const neighborOwner = state.nations.get(state.territories[id].ownerId);
       if (!neighborOwner || neighborOwner.id === owner.id) return sum + 0.12;
       if (owner.allies.has(neighborOwner.id)) return sum + 0.22;
-      if (owner.wars.has(neighborOwner.id)) return sum - 0.28;
+      if (owner.wars.has(neighborOwner.id)) return sum - (0.2 - resilience * 0.07);
       return sum + clamp((getRelation(owner.id, neighborOwner.id) + 40) / 520, -0.08, 0.16);
     }, 0);
     const hostileNeighborCount = territory.neighbors.reduce((sum, id) => sum + (owner.wars.has(state.territories[id]?.ownerId) ? 1 : 0), 0);
-    const tradeBonus = clamp(tradeAccess / Math.max(1, territory.neighbors.length) - (atWar ? 0.04 + hostileNeighborCount * 0.018 : 0), -0.26, 0.2);
-    const debtDrag = owner.treasury < -150 ? 0.004 : 0;
-    const ideologyGrowth = owner.ideology.economy * 0.006;
-    const warTradePenalty = atWar ? clamp(0.009 + owner.wars.size * 0.004 + owner.warExhaustion * 0.01 + hostileNeighborCount * 0.003, 0, 0.045) : 0;
-    const peaceBonus = atWar ? -0.01 - owner.warExhaustion * 0.004 : 0.004;
-    const instabilityDrag = territory.unrest * 0.01 + owner.warExhaustion * (atWar ? 0.006 : 0.002) + territory.occupation * 0.004 + warTradePenalty + debtDrag;
+    const frontlinePressure = hostileNeighborCount / Math.max(1, territory.neighbors.length);
+    const tradeBonus = clamp(
+      tradeAccess / Math.max(1, territory.neighbors.length) - (atWar ? 0.018 + frontlinePressure * (0.12 - resilience * 0.05) : 0),
+      -0.22,
+      0.22,
+    );
+    const debtDrag = owner.treasury < -180 ? clamp(Math.abs(owner.treasury + 180) / 3000, 0.002, 0.014) : 0;
+    const ideologyGrowth = owner.ideology.economy * 0.0055;
+    const peaceBonus = atWar ? 0.001 : 0.0045;
+    const mobilizationBoost = atWar
+      ? clamp(
+          (economicDepthValue * 0.006 + owner.tech * 0.0035 + fiscalHealth(owner) * 0.0025) *
+            (1 - frontlinePressure * 0.55) *
+            (1 - owner.warExhaustion * 0.45),
+          0,
+          0.012,
+        )
+      : 0;
+    const warDisruption = atWar
+      ? clamp(
+          (0.003 + owner.wars.size * 0.0018 + owner.warExhaustion * 0.01 + frontlinePressure * 0.019 + territory.occupation * 0.02) *
+            (1 - resilience * 0.62),
+          0,
+          0.038,
+        )
+      : 0;
+    const unrestDrag = territory.unrest * (0.006 + (1 - owner.legitimacy) * 0.006);
+    const occupationDrag = territory.occupation * 0.01;
+    const instabilityDrag = unrestDrag + occupationDrag + warDisruption + debtDrag;
     const growth = clamp(
-      (ideologyGrowth + peaceBonus + tradeBonus * 0.012 - instabilityDrag) * monthScale + (rng() - 0.48) * 0.004 * volatility,
-      -0.018 * Math.max(monthScale, 0.08),
-      0.018 * Math.max(monthScale, 0.08),
+      (ideologyGrowth + peaceBonus + tradeBonus * 0.01 + mobilizationBoost - instabilityDrag) * monthScale +
+        (rng() - 0.48) * 0.0035 * volatility,
+      -0.014 * Math.max(monthScale, 0.08),
+      0.02 * Math.max(monthScale, 0.08),
     );
     territory.gdp = Math.max(24, territory.gdp * (1 + growth));
     territory.population = Math.max(
@@ -1962,23 +2033,37 @@ function updateEconomy(monthScale = 1) {
 
   recalculateNationStats();
 
-  for (const nation of liveNations()) {
+  const nations = liveNations();
+  const maxUpdatedGdp = Math.max(1, ...nations.map((nation) => nation.gdp));
+  for (const nation of nations) {
+    const depth = economicDepth(nation, maxUpdatedGdp);
+    const resilience = wartimeEconomicResilience(nation, maxUpdatedGdp);
     const tax = clamp(nation.ideology.tax + (nation.stability < 0.34 ? 0.03 : 0) + (nation.treasury < -250 ? 0.025 : 0), 0.08, 0.42);
     const income = nation.gdp * tax * 0.000085;
     const puppetTribute = nation.overlordId && state.nations.get(nation.overlordId)?.alive ? income * 0.1 : 0;
-    const maintenance = nation.army * (0.18 + nation.tech * 0.05 + nation.wars.size * 0.05);
-    const investment = Math.max(0, Math.min(income * 0.18, nation.treasury * 0.08));
+    const logisticsEfficiency = clamp(depth * 0.22 + nation.tech * 0.14 + resilience * 0.08, 0, 0.38);
+    const maintenance = nation.army * (0.17 + nation.tech * 0.045 + nation.wars.size * 0.038) * (1 - logisticsEfficiency);
+    const warProduction = nation.wars.size ? income * clamp(0.035 + depth * 0.07 + nation.tech * 0.025, 0.035, 0.13) : 0;
+    const investmentRate = nation.wars.size ? clamp(0.09 + resilience * 0.06 - nation.warExhaustion * 0.05, 0.03, 0.16) : 0.2;
+    const investment = Math.max(0, Math.min(income * investmentRate, nation.treasury * 0.08));
     nation.income = income - puppetTribute;
-    nation.expenses = maintenance + investment;
+    nation.expenses = maintenance + investment + warProduction;
     nation.treasury += (nation.income - nation.expenses) * monthScale;
     if (puppetTribute) state.nations.get(nation.overlordId).treasury += puppetTribute * monthScale;
 
+    const supportableForce =
+      1.4 +
+      (nation.population / 1_000_000) * nation.ideology.conscription * 0.9 +
+      (nation.gdp / 240_000) * (0.55 + nation.tech * 0.75);
+    const forceHeadroom = clamp((supportableForce - nation.army) / Math.max(1, supportableForce), -0.35, 1);
     const recruits =
       (nation.population / 1_000_000) *
       nation.ideology.conscription *
       (0.015 + nation.stability * 0.012) *
-      (nation.wars.size ? 1.45 : 0.75);
-    nation.army = Math.max(0, nation.army + recruits * monthScale - nation.army * 0.005 * monthScale);
+      (nation.wars.size ? 1.22 + depth * 0.38 : 0.68) *
+      Math.max(0.18, forceHeadroom + 0.35);
+    const overextensionAttrition = forceHeadroom < 0 ? Math.abs(forceHeadroom) * 0.016 : 0;
+    nation.army = Math.max(0, nation.army + recruits * monthScale - nation.army * (0.004 + overextensionAttrition) * monthScale);
 
     if (nation.treasury < -250) {
       nation.stability = clamp(nation.stability - 0.012 * monthScale, 0.04, 1);
@@ -2001,7 +2086,9 @@ function updateEconomy(monthScale = 1) {
     }
 
     nation.warExhaustion = clamp(
-      nation.warExhaustion + (nation.wars.size * 0.035 - (nation.wars.size ? 0 : 0.018)) * monthScale,
+      nation.warExhaustion +
+        (nation.wars.size * (0.026 - resilience * 0.01) + Math.max(0, -fiscalHealth(nation) + 0.45) * 0.018 - (nation.wars.size ? 0 : 0.02)) *
+          monthScale,
       0,
       1,
     );
@@ -2220,13 +2307,28 @@ function warDesire(a, b, pair) {
 }
 
 function attackScore(attacker, defender) {
-  const treasuryEffect = attacker.treasury < -100 ? 0.82 : 1.04;
-  const exhaustion = 1 - attacker.warExhaustion * 0.36;
+  const referenceGdp = Math.max(attacker.gdp || 0, defender.gdp || 0, state.cachedMaxNationGdp || 1);
+  const depth = economicDepth(attacker, referenceGdp);
+  const resilience = wartimeEconomicResilience(attacker, referenceGdp);
+  const fiscal = fiscalHealth(attacker);
+  const treasuryEffect = clamp(0.82 + fiscal * 0.22, 0.72, 1.16);
+  const exhaustion = 1 - attacker.warExhaustion * (0.34 - resilience * 0.08);
+  const industrialBase =
+    relativeLog(attacker.gdp || 0, Math.max(1, defender.gdp || 1)) * 68 +
+    depth * 42 +
+    (attacker.economicScore || 0) * 0.52 +
+    (attacker.geoeconomicScore || 0) * 0.28;
   const allyHelp = [...attacker.allies].reduce((sum, id) => {
     const ally = state.nations.get(id);
-    return sum + (ally?.wars.has(defender.id) ? ally.power * 0.12 : 0);
+    return sum + (ally?.wars.has(defender.id) ? (ally.power * 0.08 + ally.economicScore * 0.12) : 0);
   }, 0);
-  return (attacker.army * 2.3 + attacker.power * 0.55 + allyHelp) * treasuryEffect * exhaustion;
+  return (
+    attacker.army * (2.0 + attacker.tech * 0.45) +
+    attacker.militaryScore * 0.85 +
+    attacker.power * 0.38 +
+    industrialBase +
+    allyHelp
+  ) * treasuryEffect * exhaustion;
 }
 
 function makeAlliance(aId, bId) {
@@ -2327,6 +2429,7 @@ function startWar(attackerId, defenderId, reason) {
 
   pushEvent("war", `${attacker.name} declares war on ${defender.name} over ${reason}.`);
   state.fillCacheDirty = true;
+  state.cachedActiveFrontVisuals = true;
   return true;
 }
 
@@ -2466,11 +2569,12 @@ function processWars(monthScale = 1) {
         const aTerr = choice(a.territories.map(id => state.territories[id]));
         const bTerr = choice(b.territories.map(id => state.territories[id]));
         if (aTerr && bTerr) {
-          // Simple naval attack: damage economy or something
-          const damage = 0.01 * tempo;
-          b.treasury = Math.max(b.treasury - damage * b.gdp, b.treasury * 0.9);
-          a.warExhaustion = Math.min(a.warExhaustion + 0.02 * tempo, 1);
-          b.warExhaustion = Math.min(b.warExhaustion + 0.02 * tempo, 1);
+          const raidPressure = (0.8 + rng() * 0.6) * tempo;
+          const defenderResilience = wartimeEconomicResilience(b, Math.max(a.gdp, b.gdp, 1));
+          b.treasury -= Math.max(1, b.income * 0.18 * raidPressure * (1 - defenderResilience * 0.55));
+          bTerr.infrastructure = clamp(bTerr.infrastructure - 0.0025 * raidPressure * (1 - defenderResilience * 0.45), 0.22, 1.62);
+          a.warExhaustion = Math.min(a.warExhaustion + 0.013 * tempo, 1);
+          b.warExhaustion = Math.min(b.warExhaustion + (0.018 - defenderResilience * 0.006) * tempo, 1);
           if (rng() < 0.1 * tempo) {
             // Occasional "victory": transfer a territory
             const targetTerr = bTerr;
@@ -2776,6 +2880,8 @@ function transferTerritory(territoryId, toNationId, { reason = "annexed", event 
   // changing territory ownership affects segment ownership mapping
   state.segmentMapDirty = true;
   state.fillCacheDirty = true;
+  state.nameIdeasDirty = true;
+  state.cachedActiveFrontVisuals = true;
 }
 
 function dominantSubdivisionOwner(territory) {
@@ -3152,7 +3258,7 @@ function cleanupDefeatedNations() {
 }
 
 function liveNations() {
-  return [...state.nations.values()].filter((nation) => nation.alive && (nation.territories.length || totalSubdivisionControlCount(nation.id) > 0));
+  return [...state.nations.values()].filter((nation) => nation.alive);
 }
 
 function worldMonthIndex() {
@@ -3221,19 +3327,27 @@ function renderAfterSimulationStep({ forceRender = false } = {}) {
     return;
   }
 
-  const isDataDrivenMap = DATA_DRIVEN_MAP_MODES.has(state.mapMode);
-  if (isDataDrivenMap) state.fillCacheDirty = true;
-  if (isDataDrivenMap || state.fillCacheDirty || state.segmentMapDirty) renderMap();
-
   const now = performance.now();
-  if (now - state.lastPanelRenderAt >= 250) {
+  const isDataDrivenMap = DATA_DRIVEN_MAP_MODES.has(state.mapMode);
+  if (isDataDrivenMap) {
+    if (now - state.lastDataMapRenderAt >= 650) {
+      state.fillCacheDirty = true;
+      renderMap();
+      state.lastDataMapRenderAt = now;
+    }
+  } else if (state.fillCacheDirty || state.segmentMapDirty) {
+    renderMap();
+    state.lastDataMapRenderAt = now;
+  }
+
+  if (now - state.lastPanelRenderAt >= 500) {
     renderSelection();
     renderStats();
     renderHistory();
     syncControls();
     state.lastPanelRenderAt = now;
   }
-  if (now - state.lastLeaderboardRenderAt >= 1000) {
+  if (now - state.lastLeaderboardRenderAt >= 1800) {
     renderLeaderboard();
     renderCountryGraphs();
     state.lastLeaderboardRenderAt = now;
@@ -3251,7 +3365,7 @@ function startVisualLoop() {
       state.fpsCounter = 0;
       state.lastFpsTime = time;
     }
-    if (time - state.lastMapAnimation > 120 && hasActiveFrontVisuals()) {
+    if (time - state.lastMapAnimation > 160 && hasActiveFrontVisuals(time)) {
       state.lastMapAnimation = time;
       renderMap();
     }
@@ -3260,14 +3374,16 @@ function startVisualLoop() {
   state.animationHandle = window.requestAnimationFrame(frame);
 }
 
-function hasActiveFrontVisuals() {
-  return (
+function hasActiveFrontVisuals(time = performance.now()) {
+  if (time - state.lastActiveVisualCheck < 400) return state.cachedActiveFrontVisuals;
+  state.lastActiveVisualCheck = time;
+  state.cachedActiveFrontVisuals =
     uniqueWars().length > 0 ||
     state.territories.some((territory) =>
       territory.captureFlash > 0.01 ||
       (territory.subdivisions && territory.subdivisions.some((s) => s.contestedById && s.contestedProgress > 0.01)),
-    )
-  );
+    );
+  return state.cachedActiveFrontVisuals;
 }
 
 function projectionForCanvas() {
@@ -3300,6 +3416,16 @@ function clearScreenPathCaches() {
   }
   state.borderPathCache = null;
   state.ownerBoundaryCache.clear();
+}
+
+function shouldPrepareSubdivisionPaths(mode = state.mapMode) {
+  if (mode === "population") return state.view.zoom >= POPULATION_SUBDIVISION_ZOOM;
+  if (mode === "political") return state.view.zoom >= POLITICAL_SUBDIVISION_ZOOM;
+  return state.view.zoom >= POLITICAL_SUBDIVISION_ZOOM + 0.35;
+}
+
+function shouldUseSubdivisionHitTest() {
+  return state.view.zoom >= SUBDIVISION_HIT_ZOOM;
 }
 
 function renderMap() {
@@ -3367,8 +3493,8 @@ function renderMap() {
     }
   }
 
-  // Cache subdivision screen-space Path2D objects when projection/view changes
-  if (rebuildPaths) {
+  // Cache expensive subdivision Path2D objects only when the current zoom/mode can show them.
+  if (rebuildPaths && shouldPrepareSubdivisionPaths(mode)) {
     for (const territory of territories) {
       const bounds = territory.screenBounds || screenBoundsForTerritory(territory, true);
       // cache screen bounds for reuse
@@ -3485,7 +3611,7 @@ function renderMap() {
         fctx.fillStyle = fillForTerritory(territory, mode);
         fctx.fill(path, "evenodd");
         // render subdivisions into the fill cache for population/political modes
-        if (mode === "population" && territory.subdivisions?.length) {
+        if (mode === "population" && shouldPrepareSubdivisionPaths(mode) && territory.subdivisions?.length) {
           renderTerritorySubdivisionsToCtx(territory, fctx, maxSubdivisionPopulation);
         }
       }
@@ -3510,7 +3636,7 @@ function renderMap() {
       }
     }
   }
-  if (mode === "population" && !didUseFillCache) drawPopulationSubdivisions();
+  if (mode === "population" && !didUseFillCache && shouldPrepareSubdivisionPaths(mode)) drawPopulationSubdivisions();
   if (mode === "political") drawSubdivisionsOverlay();
   drawContestedTerritories();
   drawMapBorders(mode);
@@ -3792,6 +3918,7 @@ function screenBoundsForTerritory(territory, force = false) {
 }
 
 function drawPopulationSubdivisions() {
+  if (!shouldPrepareSubdivisionPaths("population")) return;
   // compute max subdivision population without creating intermediate arrays
   let maxSubdivisionPopulation = 1;
   for (const territory of state.territories) {
@@ -3877,6 +4004,7 @@ function drawPopulationSubdivisions() {
 }
 
 function renderTerritorySubdivisionsToCtx(territory, toCtx, maxSubdivisionPopulation) {
+  if (!shouldPrepareSubdivisionPaths("population")) return;
   if (!territory.path || !territory.subdivisions?.length) return;
   const bounds = territory.screenBounds || screenBoundsForTerritory(territory);
   if (Math.max(bounds.width, bounds.height) < 14) return;
@@ -3931,11 +4059,11 @@ function renderTerritorySubdivisionsToCtx(territory, toCtx, maxSubdivisionPopula
 }
 
 function drawSubdivisionsOverlay() {
+  if (!shouldPrepareSubdivisionPaths("political")) return;
   // subtle subdivision outlines/fills for political map visuals (not selectable)
   for (const territory of state.territories) {
     if (!territory.path || !territory.subdivisions?.length) continue;
-    // don't render subdivision overlays at low zoom or for tiny territories
-    if (state.view.zoom < 1.6) continue;
+    // don't render subdivision overlays for tiny territories
     const projectedCenter = territory.centroid || [0, 0];
     const bounds = screenBoundsForTerritory(territory);
     const radius = Math.max(bounds.width, bounds.height) * 0.7;
@@ -4779,7 +4907,7 @@ function subdivisionAt(territory, x, y) {
 function mapSelectionAt(x, y) {
   const territory = territoryAt(x, y);
   if (!territory) return null;
-  const subdivision = subdivisionAt(territory, x, y);
+  const subdivision = shouldUseSubdivisionHitTest() ? subdivisionAt(territory, x, y) : null;
   return {
     territory,
     subdivision,
