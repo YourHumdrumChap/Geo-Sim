@@ -157,6 +157,14 @@ const DATA_DRIVEN_MAP_MODES = new Set(["economy", "stability", "unrest", "popula
 const POLITICAL_SUBDIVISION_ZOOM = 2.45;
 const POPULATION_SUBDIVISION_ZOOM = 2.05;
 const SUBDIVISION_HIT_ZOOM = 2.45;
+const REVOLT_WINDOW_MONTHS = 12;
+const MAX_REVOLTS_PER_WINDOW = 5;
+const MAX_MAJOR_REVOLTS_PER_WINDOW = 2;
+const MAX_LOCAL_REVOLTS_PER_WINDOW = 3;
+const MAX_ACTIVE_REBEL_NATIONS = 8;
+const MAX_TOTAL_NATIONS = 210;
+const MAJOR_REVOLT_COOLDOWN_MONTHS = 14;
+const LOCAL_REVOLT_COOLDOWN_MONTHS = 10;
 
 const ADMIN1_SUMMARY = window.WORLD_ADMIN1_SUMMARY || { byIso: {}, byIso3: {}, byAdmin: {}, meta: null };
 const ADMIN1_GEOMETRY = window.WORLD_ADMIN1_GEOMETRY || { byIso: {}, byIso3: {}, byAdmin: {}, meta: null };
@@ -281,6 +289,11 @@ const state = {
   lastDataMapRenderAt: 0,
   lastActiveVisualCheck: 0,
   cachedActiveFrontVisuals: false,
+  revoltWindowStart: 0,
+  revoltsThisWindow: 0,
+  majorRevoltsThisWindow: 0,
+  localRevoltsThisWindow: 0,
+  lastGlobalRevoltAt: -Infinity,
   // unit system removed
   segmentMapCache: null,
   segmentMapDirty: false,
@@ -1041,6 +1054,11 @@ function initializeGame({ scenario = state.scenario, seed = Math.floor(Math.rand
   state.lastActiveVisualCheck = 0;
   state.cachedActiveFrontVisuals = false;
   state.nameIdeasDirty = true;
+  state.revoltWindowStart = 0;
+  state.revoltsThisWindow = 0;
+  state.majorRevoltsThisWindow = 0;
+  state.localRevoltsThisWindow = 0;
+  state.lastGlobalRevoltAt = -Infinity;
   clearScreenPathCaches();
   syncCalendarFromHours();
 
@@ -1538,6 +1556,7 @@ function createNation({
   ambition = null,
   stability = null,
   treasury = null,
+  origin = "state",
 } = {}) {
   const id = state.nextNationId;
   state.nextNationId += 1;
@@ -1575,6 +1594,7 @@ function createNation({
     geoeconomicScore: 0,
     income: 0,
     expenses: 0,
+    origin,
     nameHistory: [],
     nameIdeas: [],
   };
@@ -2548,6 +2568,84 @@ function endWar(aId, bId, message = null) {
   if (message) pushEvent("diplomacy", message);
 }
 
+function reintegrateRebel(rebel, loyalist) {
+  for (const territory of state.territories) {
+    if (territory.ownerId === rebel.id) {
+      transferTerritory(territory.id, loyalist.id, { reason: "recaptured", quiet: true });
+      territory.unrest = clamp(territory.unrest - 0.22, 0.12, 0.78);
+      continue;
+    }
+    for (let i = 0; i < (territory.subdivisions || []).length; i += 1) {
+      if (territory.subdivisions[i]?.ownerId === rebel.id) {
+        transferSubdivision(territory.id, i, loyalist.id, { reason: "recaptured", quiet: true });
+        territory.unrest = clamp(territory.unrest - 0.08, 0.12, 0.85);
+      }
+    }
+  }
+  rebel.warExhaustion = 1;
+  rebel.stability = clamp(rebel.stability - 0.2, 0.02, 1);
+  loyalist.legitimacy = clamp(loyalist.legitimacy + 0.025, 0.03, 1);
+}
+
+function recognizeRebelState(rebel, loyalist) {
+  rebel.origin = "state";
+  rebel.warExhaustion = clamp(rebel.warExhaustion - 0.35, 0, 1);
+  rebel.stability = clamp(rebel.stability + 0.12, 0.08, 1);
+  rebel.legitimacy = clamp(rebel.legitimacy + 0.1, 0.08, 1);
+  loyalist.warExhaustion = clamp(loyalist.warExhaustion - 0.08, 0, 1);
+  setRelation(rebel.id, loyalist.id, -34);
+}
+
+function maybeResolveRevoltWar(a, b, duration, monthScale = 1) {
+  const reason = revoltWarReason(a, b);
+  if (!/revolt/i.test(reason)) return false;
+  let rebel = null;
+  if (isRebelNation(a) && !isRebelNation(b)) rebel = a;
+  if (isRebelNation(b) && !isRebelNation(a)) rebel = b;
+  if (!rebel) rebel = (a.controlledSubdivisions || 0) <= (b.controlledSubdivisions || 0) ? a : b;
+  const loyalist = rebel.id === a.id ? b : a;
+  if (!rebel?.alive || !loyalist?.alive) return false;
+
+  recalculateNationStats();
+  const rebelControl = totalSubdivisionControlCount(rebel.id);
+  const rebelTerritories = rebel.controlledTerritories?.length || rebel.territories.length;
+  if (rebelControl <= 0 || rebelTerritories <= 0) {
+    endWar(a.id, b.id, `${rebel.name} is dispersed by ${loyalist.name}.`);
+    return true;
+  }
+
+  if (duration < 4) return false;
+  const strengthRatio = rebel.power / Math.max(1, loyalist.power);
+  const loyalistPressure = loyalist.power / Math.max(1, rebel.power);
+  const hasRealFoothold = rebelTerritories >= 1 && rebelControl >= 2;
+  const suppressionChance = clamp(0.05 + loyalistPressure * 0.035 + loyalist.stability * 0.035 - rebel.stability * 0.03, 0.02, 0.32);
+  const recognitionChance = clamp(0.015 + strengthRatio * 0.08 + rebel.stability * 0.045 - loyalist.stability * 0.025, 0.006, 0.22);
+
+  if ((duration > 8 || !hasRealFoothold) && loyalistPressure > 1.7 && rng() < scaledChance(suppressionChance, monthScale)) {
+    reintegrateRebel(rebel, loyalist);
+    endWar(a.id, b.id, `${loyalist.name} restores order in ${rebel.name}.`);
+    return true;
+  }
+
+  if (duration > 14 && hasRealFoothold && strengthRatio > 0.28 && rng() < scaledChance(recognitionChance, monthScale)) {
+    recognizeRebelState(rebel, loyalist);
+    endWar(a.id, b.id, `${loyalist.name} recognizes ${rebel.name} after a costly revolt.`);
+    return true;
+  }
+
+  if (duration > 30) {
+    if (hasRealFoothold && strengthRatio > 0.18) {
+      recognizeRebelState(rebel, loyalist);
+      endWar(a.id, b.id, `${rebel.name} survives long enough to force a settlement with ${loyalist.name}.`);
+    } else {
+      reintegrateRebel(rebel, loyalist);
+      endWar(a.id, b.id, `${rebel.name} fades after a prolonged insurgency.`);
+    }
+    return true;
+  }
+  return false;
+}
+
 function processWars(monthScale = 1) {
   const wars = uniqueWars();
   for (const [aId, bId] of wars) {
@@ -2586,6 +2684,7 @@ function processWars(monthScale = 1) {
         }
       }
       // End island war after longer time or by chance
+      if (maybeResolveRevoltWar(a, b, duration, monthScale)) continue;
       if (duration > 12 || rng() < scaledChance(0.1, monthScale)) {
         endWar(aId, bId, `${a.name} and ${b.name} end their naval war.`);
       }
@@ -2601,6 +2700,7 @@ function processWars(monthScale = 1) {
       }
     }
 
+    if (maybeResolveRevoltWar(a, b, duration, monthScale)) continue;
     maybeResolveWar(a, b, duration, monthScale);
   }
   // unit movement/skirmish system removed
@@ -3018,125 +3118,214 @@ function makePuppet(subjectId, overlordId) {
   state.fillCacheDirty = true;
 }
 
-function processRevolts(monthScale = 1) {
-  // Civil revolts: require high unrest plus clear owner weakness or occupation.
-  const candidates = state.territories.filter((territory) => {
-    const owner = state.nations.get(territory.ownerId);
-    if (!owner?.alive) return false;
-    if (owner.territories.length <= 1) return false;
-    // require significant unrest
-    if (territory.unrest < 0.62) return false;
-    // simple cooldown: don't allow repeated revolts in same territory within ~6 months
-    if (territory.lastRevoltAt && worldMonthIndex() - territory.lastRevoltAt < 6) return false;
-    // if owner looks strong and legitimate, skip
-    if (owner.stability > 0.6 && owner.legitimacy > 0.65 && owner.treasury > -100 && owner.warExhaustion < 0.3 && territory.occupation < 0.08)
-      return false;
-    return true;
-  });
+function isRebelNation(nation) {
+  return nation?.origin === "revolt" || nation?.origin === "localRevolt";
+}
 
-  for (const territory of candidates) {
-    const owner = state.nations.get(territory.ownerId);
-    // Check for nearby military presence: nearby armies suppress revolts
-    const militaryPresence = checkNearbyMilitaryPresence(territory, owner.id, 3);
-    const unrestFactor = Math.pow(Math.max(0, (territory.unrest - 0.6) / 0.4), 2);
-    const financialStress = owner.treasury < 0 ? clamp(-owner.treasury / 600, 0, 1) : 0;
-    const ownerWeakness = (1 - owner.stability) * 0.5 + owner.warExhaustion * 0.35 + financialStress * 0.25 + territory.occupation * 0.4;
-    // Historical/core territory suppresses revolts (harder to rebel in heartland)
-    const coreBonus = territory.originalOwnerId === owner.id ? 0.3 : 0;
-    let chance = 0.006 + unrestFactor * 0.06 + ownerWeakness * 0.045 - owner.legitimacy * 0.02 - militaryPresence * 0.15 - coreBonus;
-    chance = clamp(chance, 0.002, 0.18);
+function activeRebelNations() {
+  return liveNations().filter((nation) => isRebelNation(nation) && nation.wars.size);
+}
+
+function revoltWarReason(a, b) {
+  return a?.wars.get(b?.id)?.reason || b?.wars.get(a?.id)?.reason || "";
+}
+
+function hasActiveCivilRevolt(nation) {
+  if (!nation?.wars?.size) return false;
+  for (const enemyId of nation.wars.keys()) {
+    const enemy = state.nations.get(enemyId);
+    if (/revolt/i.test(revoltWarReason(nation, enemy))) return true;
+  }
+  return false;
+}
+
+function resetRevoltWindowIfNeeded() {
+  const now = worldMonthIndex();
+  if (now - state.revoltWindowStart < REVOLT_WINDOW_MONTHS) return;
+  state.revoltWindowStart = now;
+  state.revoltsThisWindow = 0;
+  state.majorRevoltsThisWindow = 0;
+  state.localRevoltsThisWindow = 0;
+}
+
+function canCreateRevoltNation(kind, owner = null) {
+  resetRevoltWindowIfNeeded();
+  const now = worldMonthIndex();
+  if (liveNations().length >= MAX_TOTAL_NATIONS) return false;
+  if (activeRebelNations().length >= MAX_ACTIVE_REBEL_NATIONS) return false;
+  if (state.revoltsThisWindow >= MAX_REVOLTS_PER_WINDOW) return false;
+  if (kind === "major" && state.majorRevoltsThisWindow >= MAX_MAJOR_REVOLTS_PER_WINDOW) return false;
+  if (kind === "local" && state.localRevoltsThisWindow >= MAX_LOCAL_REVOLTS_PER_WINDOW) return false;
+  if (now - state.lastGlobalRevoltAt < (kind === "major" ? 1.8 : 1.1)) return false;
+  if (owner?.lastRevoltAt && now - owner.lastRevoltAt < (kind === "major" ? MAJOR_REVOLT_COOLDOWN_MONTHS : LOCAL_REVOLT_COOLDOWN_MONTHS)) {
+    return false;
+  }
+  return true;
+}
+
+function recordRevoltCreation(kind, owner = null) {
+  resetRevoltWindowIfNeeded();
+  state.revoltsThisWindow += 1;
+  if (kind === "major") state.majorRevoltsThisWindow += 1;
+  if (kind === "local") state.localRevoltsThisWindow += 1;
+  state.lastGlobalRevoltAt = worldMonthIndex();
+  if (owner) owner.lastRevoltAt = worldMonthIndex();
+}
+
+function nearbyRebelForTerritory(territory, ownerId) {
+  for (const neighborId of territory.neighbors || []) {
+    const neighborOwner = state.nations.get(state.territories[neighborId]?.ownerId);
+    if (neighborOwner?.alive && neighborOwner.id !== ownerId && isRebelNation(neighborOwner) && neighborOwner.wars.has(ownerId)) {
+      return neighborOwner;
+    }
+  }
+  return null;
+}
+
+function simmerInsurgency(territory, owner, intensity = 0.05) {
+  territory.unrest = clamp(territory.unrest + intensity * 0.45, 0, 1);
+  territory.occupation = clamp(territory.occupation + intensity * 0.18, 0, 1);
+  owner.legitimacy = clamp(owner.legitimacy - intensity * 0.018, 0.03, 1);
+  owner.stability = clamp(owner.stability - intensity * 0.012, 0.04, 1);
+}
+
+function processRevolts(monthScale = 1) {
+  resetRevoltWindowIfNeeded();
+  const now = worldMonthIndex();
+
+  const majorCandidates = state.territories
+    .map((territory) => {
+      const owner = state.nations.get(territory.ownerId);
+      if (!owner?.alive || owner.territories.length <= 2) return null;
+      const unrestThreshold = territory.occupation > 0.32 ? 0.68 : 0.78;
+      if (territory.unrest < unrestThreshold) return null;
+      if (territory.lastRevoltAt && now - territory.lastRevoltAt < MAJOR_REVOLT_COOLDOWN_MONTHS) return null;
+      if (owner.stability > 0.55 && owner.legitimacy > 0.58 && owner.treasury > -180 && owner.warExhaustion < 0.45 && territory.occupation < 0.16) {
+        return null;
+      }
+      const militaryPresence = checkNearbyMilitaryPresence(territory, owner.id, 3);
+      const financialStress = owner.treasury < 0 ? clamp(-owner.treasury / 750, 0, 1) : 0;
+      const ownerWeakness = (1 - owner.stability) * 0.42 + owner.warExhaustion * 0.34 + financialStress * 0.18 + territory.occupation * 0.32;
+      const unrestFactor = Math.pow(Math.max(0, (territory.unrest - unrestThreshold) / Math.max(0.08, 1 - unrestThreshold)), 1.7);
+      const corePenalty = territory.originalOwnerId === owner.id ? 0.16 : 0;
+      const activeCivilPenalty = hasActiveCivilRevolt(owner) ? 0.08 : 0;
+      const chance = clamp(0.0015 + unrestFactor * 0.032 + ownerWeakness * 0.022 - owner.legitimacy * 0.018 - militaryPresence * 0.11 - corePenalty - activeCivilPenalty, 0, 0.075);
+      return { territory, owner, chance, score: chance + territory.unrest * 0.04 + ownerWeakness * 0.03 };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 4);
+
+  for (const item of majorCandidates) {
+    const { territory, owner, chance } = item;
     if (rng() > scaledChance(chance, monthScale)) continue;
 
-    // create a localized rebel nation
+    const existingRebel = nearbyRebelForTerritory(territory, owner.id);
+    if (existingRebel && territory.unrest > 0.82) {
+      transferTerritory(territory.id, existingRebel.id, { reason: "liberated", quiet: true });
+      territory.unrest = clamp(territory.unrest - 0.18, 0.22, 0.9);
+      territory.lastRevoltAt = now;
+      pushEvent("revolt", `${existingRebel.name} expands into ${territory.originalName}.`);
+      continue;
+    }
+
+    if (!canCreateRevoltNation("major", owner)) {
+      simmerInsurgency(territory, owner, 0.08);
+      territory.lastRevoltAt = now;
+      continue;
+    }
+
     const ideology = choice([IDEOLOGIES[0], IDEOLOGIES[3], IDEOLOGIES[5], owner.ideology]);
     const rebel = createNation({
-      name: `${territory.name} ${choice(["Free State", "Commune", "Restoration", "Front"])}`,
+      name: `${territory.name} ${choice(["Free State", "Restoration Front", "Autonomy Council"])}`,
       capitalId: territory.id,
       ideology,
       color: shiftColor(owner.color, 44),
-      ambition: 0.38 + rng() * 0.42,
-      stability: 0.34 + rng() * 0.3,
-      treasury: 50 + rng() * 180,
+      ambition: 0.34 + rng() * 0.34,
+      stability: 0.38 + rng() * 0.26,
+      treasury: 80 + rng() * 140,
+      origin: "revolt",
     });
+    recordRevoltCreation("major", owner);
 
     transferTerritory(territory.id, rebel.id, { reason: "liberated", quiet: true });
     territory.capital = true;
     territory.coreOwnerId = rebel.id;
-    territory.unrest = clamp(territory.unrest - 0.22, 0.2, 0.86);
-    territory.lastRevoltAt = worldMonthIndex();
+    territory.unrest = clamp(territory.unrest - 0.28, 0.18, 0.78);
+    territory.lastRevoltAt = now;
 
-    // neighboring spread: cascade effect if neighbors are already unstable and nearby enemy military presence is weak
-    for (const neighborId of territory.neighbors) {
-      const neighbor = state.territories[neighborId];
-      if (neighbor.ownerId === owner.id && neighbor.unrest > 0.68) {
-        const neighborMilitary = checkNearbyMilitaryPresence(neighbor, owner.id, 2);
-        if (rng() < (0.28 - neighborMilitary * 0.25)) {
-          transferTerritory(neighbor.id, rebel.id, { reason: "liberated", quiet: true });
-        }
-      }
+    const spreadTargets = territory.neighbors
+      .map((id) => state.territories[id])
+      .filter((neighbor) => neighbor?.ownerId === owner.id && neighbor.unrest > 0.82)
+      .sort((a, b) => b.unrest - a.unrest)
+      .slice(0, 1);
+    for (const neighbor of spreadTargets) {
+      const neighborMilitary = checkNearbyMilitaryPresence(neighbor, owner.id, 2);
+      if (rng() < 0.1 - neighborMilitary * 0.08) transferTerritory(neighbor.id, rebel.id, { reason: "liberated", quiet: true });
     }
 
     startWar(rebel.id, owner.id, "civil revolt");
-    pushEvent("revolt", `${rebel.name} erupts from unrest inside ${owner.name}.`);
+    pushEvent("revolt", `${rebel.name} breaks away from ${owner.name}.`);
   }
 
-  // Subdivision-level revolts: local insurgencies. Make them rarer and sensitive to local unrest and population share.
+  const localCandidates = [];
   for (const territory of state.territories) {
-    if (!territory.subdivisions?.length) continue;
+    if (!territory.subdivisions?.length || territory.unrest < 0.64) continue;
     const owner = state.nations.get(territory.ownerId);
-    if (!owner?.alive) continue;
+    if (!owner?.alive || owner.territories.length <= 1) continue;
+    if (owner.stability > 0.58 && owner.legitimacy > 0.62 && owner.warExhaustion < 0.52 && territory.occupation < 0.12) continue;
     const territoryMilitary = checkNearbyMilitaryPresence(territory, owner.id, 2);
     for (let i = 0; i < territory.subdivisions.length; i += 1) {
-      const s = territory.subdivisions[i];
-      // cooldown to avoid churn
-      if (s.lastRevoltAt && worldMonthIndex() - s.lastRevoltAt < 6) continue;
-      const popShare = s.populationShare ?? 1 / territory.subdivisions.length;
-      // require at least modest local share and moderate territory unrest
-      if (popShare < 0.035 || territory.unrest < 0.5) continue;
-      const subdivUnrest = territory.unrest * (0.5 + 0.8 * popShare);
-
-      // skip if owner is relatively stable/legitimate
-      if (owner.stability > 0.62 && owner.legitimacy > 0.66 && owner.warExhaustion < 0.4 && territory.occupation < 0.08) continue;
-
-      const severity = Math.pow(Math.max(0, (subdivUnrest - 0.45) / 0.55), 2);
-      const financialStress = owner.treasury < 0 ? clamp(-owner.treasury / 600, 0, 1) : 0;
-      const ownerWeakness = (1 - owner.stability) * 0.4 + owner.warExhaustion * 0.25 + financialStress * 0.2 + territory.occupation * 0.3;
-      // Core/historical suppression of revolts
-      const coreBonus = s.originalOwnerId === owner.id ? 0.15 : 0;
-      let chance = 0.003 + severity * 0.05 + ownerWeakness * 0.03 - owner.legitimacy * 0.015 - territoryMilitary * 0.08 - coreBonus;
-      chance = clamp(chance, 0.001, 0.12);
-      if (rng() > scaledChance(chance, monthScale)) continue;
-
-      const ideology = choice([IDEOLOGIES[0], IDEOLOGIES[3], IDEOLOGIES[5], owner.ideology]);
-      const rebel = createNation({
-        name: `${s.name || territory.name} ${choice(["Liberation Front", "Rebels", "Insurgents", "Autonomy Movement"])}`,
-        capitalId: territory.id,
-        ideology,
-        color: shiftColor(owner.color, 32),
-        ambition: 0.28 + rng() * 0.46,
-        stability: 0.26 + rng() * 0.38,
-        treasury: 30 + rng() * 100,
-      });
-
-      transferSubdivision(territory.id, i, rebel.id, { reason: "liberated", quiet: true });
-      s.lastRevoltAt = worldMonthIndex();
-      startWar(rebel.id, owner.id, "subdivision revolt");
-      pushEvent("revolt", `${rebel.name} rises in ${s.name || territory.name}.`);
-
-      // Smart spread: only spread if unrest is contagious and owner is weak
-      if (rng() < (0.12 - territoryMilitary * 0.08) && owner.warExhaustion > 0.4) {
-        for (const nid of territory.neighbors) {
-          const neighbor = state.territories[nid];
-          if (!neighbor?.subdivisions?.length) continue;
-          if (neighbor.ownerId !== owner.id) continue;
-          // Spread only if neighbor is also unstable
-          if (neighbor.unrest > 0.52) {
-            const idx = Math.floor(rng() * neighbor.subdivisions.length);
-            transferSubdivision(neighbor.id, idx, rebel.id, { reason: "liberated", quiet: true });
-          }
-        }
-      }
+      const subdivision = territory.subdivisions[i];
+      if (subdivision.lastRevoltAt && now - subdivision.lastRevoltAt < LOCAL_REVOLT_COOLDOWN_MONTHS) continue;
+      const popShare = subdivision.populationShare ?? 1 / territory.subdivisions.length;
+      if (popShare < 0.06) continue;
+      const severity = Math.pow(Math.max(0, (territory.unrest - 0.62) / 0.38), 1.8) * clamp(popShare * 8, 0.35, 1.4);
+      const financialStress = owner.treasury < 0 ? clamp(-owner.treasury / 800, 0, 1) : 0;
+      const ownerWeakness = (1 - owner.stability) * 0.34 + owner.warExhaustion * 0.24 + financialStress * 0.14 + territory.occupation * 0.24;
+      const chance = clamp(0.0008 + severity * 0.014 + ownerWeakness * 0.014 - owner.legitimacy * 0.012 - territoryMilitary * 0.06, 0, 0.042);
+      localCandidates.push({ territory, owner, subdivision, index: i, chance, score: chance + severity * 0.02 });
     }
+  }
+
+  localCandidates.sort((a, b) => b.score - a.score);
+  for (const item of localCandidates.slice(0, 8)) {
+    const { territory, owner, subdivision, index, chance } = item;
+    if (rng() > scaledChance(chance, monthScale)) continue;
+
+    const existingRebel = nearbyRebelForTerritory(territory, owner.id);
+    if (existingRebel) {
+      transferSubdivision(territory.id, index, existingRebel.id, { reason: "liberated", quiet: true });
+      subdivision.lastRevoltAt = now;
+      territory.unrest = clamp(territory.unrest - 0.08, 0.2, 0.9);
+      if (rng() < 0.35) pushEvent("revolt", `${existingRebel.name} gains support in ${subdivision.name || territory.name}.`);
+      continue;
+    }
+
+    if (!canCreateRevoltNation("local", owner) || territory.unrest < 0.76) {
+      simmerInsurgency(territory, owner, 0.045);
+      subdivision.lastRevoltAt = now;
+      continue;
+    }
+
+    const ideology = choice([IDEOLOGIES[0], IDEOLOGIES[3], IDEOLOGIES[5], owner.ideology]);
+    const rebel = createNation({
+      name: `${subdivision.name || territory.name} ${choice(["Autonomy Front", "Liberation Council"])}`,
+      capitalId: territory.id,
+      ideology,
+      color: shiftColor(owner.color, 32),
+      ambition: 0.24 + rng() * 0.32,
+      stability: 0.32 + rng() * 0.28,
+      treasury: 45 + rng() * 70,
+      origin: "localRevolt",
+    });
+    recordRevoltCreation("local", owner);
+
+    transferSubdivision(territory.id, index, rebel.id, { reason: "liberated", quiet: true });
+    subdivision.lastRevoltAt = now;
+    territory.unrest = clamp(territory.unrest - 0.12, 0.2, 0.86);
+    startWar(rebel.id, owner.id, "local revolt");
+    pushEvent("revolt", `${rebel.name} rises in ${subdivision.name || territory.name}.`);
   }
 }
 
