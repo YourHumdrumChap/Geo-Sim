@@ -153,6 +153,8 @@ const MAP_MODES = {
   landmass: "Landmass",
 };
 
+const DATA_DRIVEN_MAP_MODES = new Set(["economy", "stability", "unrest", "population"]);
+
 const ADMIN1_SUMMARY = window.WORLD_ADMIN1_SUMMARY || { byIso: {}, byIso3: {}, byAdmin: {}, meta: null };
 const ADMIN1_GEOMETRY = window.WORLD_ADMIN1_GEOMETRY || { byIso: {}, byIso3: {}, byAdmin: {}, meta: null };
 const GENERIC_SUBDIVISION_TYPES = ["Province", "Region", "Territory", "District"];
@@ -271,12 +273,20 @@ const state = {
   fps: 0,
   fpsCounter: 0,
   lastFpsTime: 0,
+  lastPanelRenderAt: 0,
+  lastLeaderboardRenderAt: 0,
   // unit system removed
   segmentMapCache: null,
   segmentMapDirty: false,
+  segmentMapVersion: 0,
+  borderPathCache: null,
+  ownerBoundaryCache: new Map(),
   // fill cache for territory base fills per `mapMode`
   fillCache: null,
   fillCacheDirty: true,
+  bgCanvas: null,
+  lastProjectionKey: null,
+  eventLinkCache: null,
   // cached aggregates to avoid repeated array allocations
   cachedMaxPopulation: 1,
   cachedMaxGdp: 1,
@@ -315,9 +325,16 @@ function pairKey(a, b) {
   return a < b ? `${a}|${b}` : `${b}|${a}`;
 }
 
+const NUMBER_FORMATTERS = new Map();
+
 function formatNumber(value, digits = 0) {
   if (!Number.isFinite(value)) return "0";
-  return new Intl.NumberFormat("en-US", { maximumFractionDigits: digits }).format(value);
+  let formatter = NUMBER_FORMATTERS.get(digits);
+  if (!formatter) {
+    formatter = new Intl.NumberFormat("en-US", { maximumFractionDigits: digits });
+    NUMBER_FORMATTERS.set(digits, formatter);
+  }
+  return formatter.format(value);
 }
 
 function formatPopulation(value) {
@@ -999,6 +1016,18 @@ function initializeGame({ scenario = state.scenario, seed = Math.floor(Math.rand
   state.hoveredTerritoryId = null;
   state.hoveredSubdivisionId = null;
   state.view = { zoom: 1, panX: 0, panY: 0 };
+  state.segmentMapCache = null;
+  state.segmentMapDirty = true;
+  state.borderPathCache = null;
+  state.ownerBoundaryCache.clear();
+  state.fillCache = null;
+  state.fillCacheDirty = true;
+  state.bgCanvas = null;
+  state.lastProjectionKey = null;
+  state.eventLinkCache = null;
+  state.lastPanelRenderAt = 0;
+  state.lastLeaderboardRenderAt = 0;
+  clearScreenPathCaches();
   syncCalendarFromHours();
 
   for (const territory of state.territories) {
@@ -1844,7 +1873,7 @@ function advanceMonth() {
   advanceTime(HOURS_PER_MONTH);
 }
 
-function advanceTime(hours = state.timeStepHours) {
+function advanceTime(hours = state.timeStepHours, { forceRender = false } = {}) {
   const stepHours = Math.max(1, Number(hours) || 1);
   state.elapsedHours += stepHours;
   syncCalendarFromHours();
@@ -1863,7 +1892,7 @@ function advanceTime(hours = state.timeStepHours) {
   recalculateNationStats();
   cleanupDefeatedNations();
   captureHistory();
-  renderAll();
+  renderAfterSimulationStep({ forceRender });
 }
 
 function simulationDate() {
@@ -2207,6 +2236,7 @@ function makeAlliance(aId, bId) {
   a.allies.add(bId);
   b.allies.add(aId);
   adjustRelation(aId, bId, 18);
+  state.fillCacheDirty = true;
   pushEvent("diplomacy", `${a.name} and ${b.name} sign an alliance.`);
 }
 
@@ -2216,6 +2246,7 @@ function breakAlliance(aId, bId, reason) {
   if (!a || !b) return;
   a.allies.delete(bId);
   b.allies.delete(aId);
+  state.fillCacheDirty = true;
   pushEvent("diplomacy", `${a.name} and ${b.name} end their alliance after ${reason}.`);
 }
 
@@ -2410,6 +2441,7 @@ function endWar(aId, bId, message = null) {
 
   if (a) a.wars.delete(bId);
   if (b) b.wars.delete(aId);
+  state.fillCacheDirty = true;
   if (message) pushEvent("diplomacy", message);
 }
 
@@ -2877,6 +2909,7 @@ function makePuppet(subjectId, overlordId) {
   subject.warExhaustion = clamp(subject.warExhaustion - 0.18, 0, 1);
   subject.legitimacy = clamp(subject.legitimacy - 0.1, 0, 1);
   setRelation(subject.id, overlord.id, -8);
+  state.fillCacheDirty = true;
 }
 
 function processRevolts(monthScale = 1) {
@@ -3155,6 +3188,7 @@ function pushEvent(type, text) {
     date: currentDateLabel(),
   });
   if (state.eventLog.length > 120) state.eventLog.pop();
+  state.eventLinkCache = null;
   renderEventLog();
 }
 
@@ -3165,15 +3199,45 @@ function resizeCanvas() {
   renderMap();
 }
 
-function renderAll() {
-  renderMap();
+function renderPanels() {
   renderSelection();
   renderStats();
   renderLeaderboard();
   renderCountryGraphs();
-  renderEventLog();
   renderHistory();
   syncControls();
+}
+
+function renderAll() {
+  renderMap();
+  renderPanels();
+  state.lastPanelRenderAt = performance.now();
+  state.lastLeaderboardRenderAt = state.lastPanelRenderAt;
+}
+
+function renderAfterSimulationStep({ forceRender = false } = {}) {
+  if (forceRender || !state.running) {
+    renderAll();
+    return;
+  }
+
+  const isDataDrivenMap = DATA_DRIVEN_MAP_MODES.has(state.mapMode);
+  if (isDataDrivenMap) state.fillCacheDirty = true;
+  if (isDataDrivenMap || state.fillCacheDirty || state.segmentMapDirty) renderMap();
+
+  const now = performance.now();
+  if (now - state.lastPanelRenderAt >= 250) {
+    renderSelection();
+    renderStats();
+    renderHistory();
+    syncControls();
+    state.lastPanelRenderAt = now;
+  }
+  if (now - state.lastLeaderboardRenderAt >= 1000) {
+    renderLeaderboard();
+    renderCountryGraphs();
+    state.lastLeaderboardRenderAt = now;
+  }
 }
 
 function startVisualLoop() {
@@ -3228,6 +3292,16 @@ function projectToScreen(point) {
   ];
 }
 
+function clearScreenPathCaches() {
+  for (const territory of state.territories) {
+    territory.path = null;
+    territory.screenBounds = null;
+    for (const subdivision of territory.subdivisions || []) subdivision.path = null;
+  }
+  state.borderPathCache = null;
+  state.ownerBoundaryCache.clear();
+}
+
 function renderMap() {
   if (!state.territories.length || !canvas.width || !canvas.height) return;
   state.projection = projectionForCanvas();
@@ -3237,6 +3311,7 @@ function renderMap() {
   const projectionKey = `${state.view.zoom}|${state.view.panX}|${state.view.panY}|${state.projection.scale}|${state.projection.baseX}|${state.projection.baseY}|${canvas.width}|${canvas.height}`;
   const rebuildPaths = state.lastProjectionKey !== projectionKey;
   if (rebuildPaths) {
+    clearScreenPathCaches();
     try {
       const bg = document.createElement("canvas");
       bg.width = canvas.width;
@@ -3255,20 +3330,22 @@ function renderMap() {
   const mode = state.mapMode;
   const territories = state.territories;
   // Cache global aggregates once per render to avoid repeated allocations
-  let maxPop = 1;
-  let maxGdp = 1;
-  for (const t of territories) {
-    if (t && Number.isFinite(t.population)) maxPop = Math.max(maxPop, t.population);
-    if (t && Number.isFinite(t.gdp)) maxGdp = Math.max(maxGdp, t.gdp);
+  if (mode === "population" || mode === "economy") {
+    let maxPop = 1;
+    let maxGdp = 1;
+    for (const t of territories) {
+      if (mode === "population" && t && Number.isFinite(t.population)) maxPop = Math.max(maxPop, t.population);
+      if (mode === "economy" && t && Number.isFinite(t.gdp)) maxGdp = Math.max(maxGdp, t.gdp);
+    }
+    if (mode === "population") state.cachedMaxPopulation = maxPop;
+    if (mode === "economy") state.cachedMaxGdp = maxGdp;
   }
-  state.cachedMaxPopulation = maxPop;
-  state.cachedMaxGdp = maxGdp;
   // Avoid rebuilding territory path geometry every frame - only when projection/view changes
   // `rebuildPaths` set above when background was rebuilt
   const offscreenMargin = 96;
   if (rebuildPaths) {
     for (const territory of territories) {
-      const bounds = screenBoundsForTerritory(territory);
+      const bounds = screenBoundsForTerritory(territory, true);
       // skip heavy geometry for territories well off-screen
       if (
         bounds.maxX < -offscreenMargin ||
@@ -3276,8 +3353,6 @@ function renderMap() {
         bounds.maxY < -offscreenMargin ||
         bounds.minY > canvas.height + offscreenMargin
       ) {
-        // clear or retain previous path to free memory for offscreen areas
-        territory.path = territory.path || null;
         // cache screen bounds for culling
         territory.screenBounds = bounds;
         continue;
@@ -3295,7 +3370,7 @@ function renderMap() {
   // Cache subdivision screen-space Path2D objects when projection/view changes
   if (rebuildPaths) {
     for (const territory of territories) {
-      const bounds = screenBoundsForTerritory(territory);
+      const bounds = territory.screenBounds || screenBoundsForTerritory(territory, true);
       // cache screen bounds for reuse
       territory.screenBounds = bounds;
       const projectedCenter = territory.centroid || [0, 0];
@@ -3383,7 +3458,7 @@ function renderMap() {
       const fc = document.createElement("canvas");
       fc.width = canvas.width;
       fc.height = canvas.height;
-      const fctx = fc.getContext("2d", { alpha: false });
+      const fctx = fc.getContext("2d");
       // precompute subdivision max for population mode to render subdivisions into the fill cache
       let maxSubdivisionPopulation = 1;
       if (mode === "population") {
@@ -3513,45 +3588,57 @@ function currentSegmentOwnerMap() {
 
   state.segmentMapCache = segments;
   state.segmentMapDirty = false;
+  state.segmentMapVersion += 1;
+  state.borderPathCache = null;
+  state.ownerBoundaryCache.clear();
   return segments;
 }
 
-function strokeProjectedSegment(segment) {
+function addProjectedSegmentToPath(target, segment) {
   if (segment.screenA && segment.screenB) {
-    ctx.moveTo(segment.screenA[0], segment.screenA[1]);
-    ctx.lineTo(segment.screenB[0], segment.screenB[1]);
+    target.moveTo(segment.screenA[0], segment.screenA[1]);
+    target.lineTo(segment.screenB[0], segment.screenB[1]);
     return;
   }
   const [x1, y1] = projectToScreen(segment.a);
   const [x2, y2] = projectToScreen(segment.b);
-  ctx.moveTo(x1, y1);
-  ctx.lineTo(x2, y2);
+  target.moveTo(x1, y1);
+  target.lineTo(x2, y2);
+}
+
+function strokeProjectedSegment(segment) {
+  addProjectedSegmentToPath(ctx, segment);
 }
 
 function drawMapBorders(mode) {
   const segmentMap = currentSegmentOwnerMap();
   const showInternal = mode === "population" || state.view.zoom > 2.7;
+  const cacheKey = `${state.lastProjectionKey}|${state.segmentMapVersion}|${showInternal ? 1 : 0}`;
+  let cache = state.borderPathCache;
+
+  if (!cache || cache.key !== cacheKey) {
+    const internalPath = new Path2D();
+    const externalPath = new Path2D();
+    for (const entry of segmentMap.values()) {
+      if (entry.owners.size === 1 && entry.territories.size > 1) addProjectedSegmentToPath(internalPath, entry.segment);
+      if (entry.territories.size === 1 || entry.owners.size > 1) addProjectedSegmentToPath(externalPath, entry.segment);
+    }
+    cache = { key: cacheKey, internalPath, externalPath };
+    state.borderPathCache = cache;
+  }
 
   if (showInternal) {
     ctx.save();
-    ctx.beginPath();
-    for (const entry of segmentMap.values()) {
-      if (entry.owners.size === 1 && entry.territories.size > 1) strokeProjectedSegment(entry.segment);
-    }
     ctx.lineWidth = 0.32 + state.view.zoom * 0.05;
     ctx.strokeStyle = mode === "population" ? "rgba(255,255,255,0.16)" : "rgba(13,15,14,0.16)";
-    ctx.stroke();
+    ctx.stroke(cache.internalPath);
     ctx.restore();
   }
 
   ctx.save();
-  ctx.beginPath();
-  for (const entry of segmentMap.values()) {
-    if (entry.territories.size === 1 || entry.owners.size > 1) strokeProjectedSegment(entry.segment);
-  }
   ctx.lineWidth = state.view.zoom > 1.5 ? 0.85 : 0.55;
   ctx.strokeStyle = "rgba(9,10,10,0.54)";
-  ctx.stroke();
+  ctx.stroke(cache.externalPath);
   ctx.restore();
 }
 
@@ -3690,8 +3777,8 @@ function hexToRgb(hex) {
   };
 }
 
-function screenBoundsForTerritory(territory) {
-  if (territory.screenBounds) return territory.screenBounds;
+function screenBoundsForTerritory(territory, force = false) {
+  if (!force && territory.screenBounds) return territory.screenBounds;
   const a = projectToScreen([territory.bounds.minX, territory.bounds.minY]);
   const b = projectToScreen([territory.bounds.maxX, territory.bounds.maxY]);
   return {
@@ -4145,17 +4232,23 @@ function drawSubdivisionFronts() {
 function drawOwnerBoundary(ownerId, options = {}) {
   if (!ownerId) return;
   const segmentMap = currentSegmentOwnerMap();
-  ctx.save();
-  ctx.beginPath();
-  for (const entry of segmentMap.values()) {
-    if (!entry.owners.has(ownerId)) continue;
-    if (entry.territories.size === 1 || entry.owners.size > 1) strokeProjectedSegment(entry.segment);
+  const cacheKey = `${state.lastProjectionKey}|${state.segmentMapVersion}|${ownerId}`;
+  let boundaryPath = state.ownerBoundaryCache.get(cacheKey);
+  if (!boundaryPath) {
+    boundaryPath = new Path2D();
+    for (const entry of segmentMap.values()) {
+      if (!entry.owners.has(ownerId)) continue;
+      if (entry.territories.size === 1 || entry.owners.size > 1) addProjectedSegmentToPath(boundaryPath, entry.segment);
+    }
+    if (state.ownerBoundaryCache.size > 16) state.ownerBoundaryCache.clear();
+    state.ownerBoundaryCache.set(cacheKey, boundaryPath);
   }
+  ctx.save();
   ctx.lineWidth = options.lineWidth || 2;
   ctx.strokeStyle = options.strokeStyle || "#ffffff";
   ctx.shadowColor = options.shadowColor || "rgba(255,255,255,0.5)";
   ctx.shadowBlur = options.shadowBlur ?? 10;
-  ctx.stroke();
+  ctx.stroke(boundaryPath);
   ctx.restore();
 }
 
@@ -4535,9 +4628,14 @@ function escapeRegExp(str) {
   return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-function linkifyEventText(text) {
-  if (!text) return "";
-  // Build a map of labels -> {type,id}. Prefer territory matches over nation matches.
+function eventLinkCacheKey() {
+  return `${state.territories.length}|${state.nations.size}|${state.nextNationId}|${state.eventLog.length}`;
+}
+
+function eventLinkifier() {
+  const key = eventLinkCacheKey();
+  if (state.eventLinkCache?.key === key) return state.eventLinkCache;
+
   const labelMap = new Map();
   for (const territory of state.territories) {
     if (territory?.name) labelMap.set(territory.name, { type: "territory", id: territory.id, label: territory.name });
@@ -4547,17 +4645,28 @@ function linkifyEventText(text) {
   }
 
   const keys = [...labelMap.keys()].sort((a, b) => b.length - a.length).map(escapeRegExp);
-  if (!keys.length) return escapeHtml(text);
-  const re = new RegExp(`(${keys.join("|")})`, "g");
+  state.eventLinkCache = {
+    key,
+    labelMap,
+    re: keys.length ? new RegExp(`(${keys.join("|")})`, "g") : null,
+  };
+  return state.eventLinkCache;
+}
+
+function linkifyEventText(text, linkifier = eventLinkifier()) {
+  if (!text) return "";
+  if (!linkifier.re) return escapeHtml(text);
 
   let last = 0;
   let out = "";
   let m;
+  const re = linkifier.re;
+  re.lastIndex = 0;
   while ((m = re.exec(text)) !== null) {
     const idx = m.index;
     const match = m[0];
     out += escapeHtml(text.slice(last, idx));
-    const info = labelMap.get(match);
+    const info = linkifier.labelMap.get(match);
     if (info) {
       if (info.type === "nation") {
         out += `<a href="#" class="event-link nation" data-nation-id="${info.id}">${escapeHtml(match)}</a>`;
@@ -4574,9 +4683,10 @@ function linkifyEventText(text) {
 }
 
 function renderEventLog() {
+  const linkifier = eventLinkifier();
   els.eventLog.innerHTML = state.eventLog
     .slice(0, 70)
-    .map((event) => `<article class="log-entry ${event.type}"><time>${escapeHtml(event.date)}</time><span>${linkifyEventText(event.text)}</span></article>`)
+    .map((event) => `<article class="log-entry ${event.type}"><time>${escapeHtml(event.date)}</time><span>${linkifyEventText(event.text, linkifier)}</span></article>`)
     .join("");
 }
 
@@ -4650,6 +4760,8 @@ function selectTerritory(id, subdivisionId = null) {
 function territoryAt(x, y) {
   for (let i = state.territories.length - 1; i >= 0; i -= 1) {
     const territory = state.territories[i];
+    const bounds = territory.screenBounds;
+    if (bounds && (x < bounds.minX || x > bounds.maxX || y < bounds.minY || y > bounds.maxY)) continue;
     if (territory.path && ctx.isPointInPath(territory.path, x, y, "evenodd")) return territory;
   }
   return null;
@@ -4847,22 +4959,30 @@ function canvasPoint(event) {
 
 function updateTooltip(event) {
   const point = canvasPoint(event);
+  const previousTerritoryId = state.hoveredTerritoryId;
+  const previousSubdivisionId = state.hoveredSubdivisionId;
   const hit = mapSelectionAt(point.x, point.y);
   const territory = hit?.territory || null;
   const sub = hit?.subdivision || null;
   state.hoveredTerritoryId = territory?.id ?? null;
   state.hoveredSubdivisionId = sub?.id ?? null;
+  const hoverChanged =
+    previousTerritoryId !== state.hoveredTerritoryId ||
+    previousSubdivisionId !== state.hoveredSubdivisionId;
   if (!territory) {
     els.mapTooltip.hidden = true;
-    renderMap();
+    if (hoverChanged) renderMap();
     return;
   }
 
   const nation = state.nations.get(hit.ownerId);
   const conquered = territory.originalOwnerId != null && territory.ownerId !== territory.originalOwnerId;
-  const topSubdivision = sub || (territory.subdivisions?.length
-    ? territory.subdivisions.slice().sort((a, b) => b.populationShare - a.populationShare)[0]
-    : null);
+  let topSubdivision = sub || null;
+  if (!topSubdivision && state.mapMode === "population" && territory.subdivisions?.length) {
+    for (const item of territory.subdivisions) {
+      if (!topSubdivision || item.populationShare > topSubdivision.populationShare) topSubdivision = item;
+    }
+  }
   els.mapTooltip.hidden = false;
   els.mapTooltip.style.left = `${Math.min(point.x + 14, canvas.width - 252)}px`;
   els.mapTooltip.style.top = `${Math.min(point.y + 14, canvas.height - 112)}px`;
@@ -4874,7 +4994,7 @@ function updateTooltip(event) {
     ${state.mapMode === "population" && topSubdivision ? `${escapeHtml(topSubdivision.name)} ${escapeHtml(formatPopulation(territory.population * topSubdivision.populationShare))}<br />` : ""}
     GDP ${escapeHtml(formatMoney(territory.gdp))} · Unrest ${Math.round(territory.unrest * 100)}%
   `;
-  renderMap();
+  if (hoverChanged) renderMap();
 }
 
 function zoomBy(multiplier) {
@@ -5029,7 +5149,7 @@ function bindEvents() {
     state.running = !state.running;
     syncControls();
   });
-  els.stepBtn.addEventListener("click", () => advanceTime(state.timeStepHours));
+  els.stepBtn.addEventListener("click", () => advanceTime(state.timeStepHours, { forceRender: true }));
   els.speedRange.addEventListener("input", () => {
     state.speed = Number(els.speedRange.value);
     startLoop();
